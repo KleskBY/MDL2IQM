@@ -89,15 +89,18 @@ def parse_qc(qc_path: Path) -> Tuple[List[str], List[QcSequence]]:
 
     lines = qc_path.read_text(encoding="utf-8", errors="ignore").splitlines()
     in_bodygroup = False
+    bodygroup_has_mesh = False
 
     for raw in lines:
         if bodygroup_start_re.match(raw):
             in_bodygroup = True
+            bodygroup_has_mesh = False
 
         if in_bodygroup:
             m = bodygroup_studio_re.match(raw)
-            if m:
+            if m and not bodygroup_has_mesh:
                 mesh_candidates.append(m.group(1) + ".smd")
+                bodygroup_has_mesh = True
             if "}" in raw:
                 in_bodygroup = False
 
@@ -444,6 +447,50 @@ def move_outputs_to_content_root(
 
     return new_iqm, new_iqm_fg
 
+
+def numbered_iqm_outputs(base_path: Path, count: int) -> List[Path]:
+    """
+    Returns:
+      <base>01.iqm
+      <base>02.iqm
+      ...
+
+    The suffix is at least two digits, growing only if there are 100+ meshes.
+    """
+    width = max(2, len(str(count)))
+    return [
+        base_path.with_name(f"{base_path.stem}{i:0{width}d}{base_path.suffix}")
+        for i in range(1, count + 1)
+    ]
+
+
+
+
+
+def build_iqm(
+    iqm_exe: Path,
+    rotate: str,
+    out_path: Path,
+    mesh_paths: List[Path],
+    anim_paths: List[Path],
+    workdir: Path,
+    modelname: str,
+) -> None:
+    if len(mesh_paths) > 1:
+        print("== Merging multiple mesh SMDs into one ==")
+        merged_mesh = workdir / f"{modelname}__merged_mesh.smd"
+        merge_mesh_smds(mesh_paths, merged_mesh, strict=False)
+        actual_mesh_paths = [merged_mesh]
+    else:
+        actual_mesh_paths = mesh_paths
+
+    cmd = [str(iqm_exe), "-r", rotate, str(out_path)]
+    cmd += [str(p) for p in actual_mesh_paths]
+    cmd += [str(p) for p in anim_paths]
+    
+    run_cmd(cmd, check=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Half-Life MDL -> IQM pipeline (mdldec + ImageMagick + iqm) with QC-driven sequences.")
     ap.add_argument("mdl", help="Path to input .mdl")
@@ -468,14 +515,13 @@ def main() -> int:
     ap.add_argument("--no-copy-textures", action="store_true", help="Disable copying textures even if --content-root is set")
 
     # In-place animation (strip root XY locomotion)
-    ap.add_argument("--no-inplace", action="store_true",
-                    help="Disable in-place root-XY stripping (default: stripping is ON)")
+    ap.add_argument("--inplace", action="store_true",
+                    help="Enable in-place root-XY stripping for animations (strips horizontal locomotion)")
 
     # Multi-mesh support
-    ap.add_argument("--merge-meshes-on-fail", action="store_true",
-                    help="If iqm fails with multiple meshes, merge mesh SMDs and retry.")
-    ap.add_argument("--force-merge-meshes", action="store_true",
-                    help="Merge meshes even if SMD headers differ (risky). Only used with --merge-meshes-on-fail.")
+    ap.add_argument("--split-per-submodel", action="store_true",
+                    help="Emit one numbered IQM per submodel (<name>01.iqm, <name>02.iqm, ...) "
+                         "instead of a single IQM containing every submodel as a mesh.")
 
     args = ap.parse_args()
 
@@ -531,12 +577,15 @@ def main() -> int:
     for p in mesh_paths:
         print("   -", p.name)
     print(f"== Sequences: {len(sequences)}")
+    if sequences:
+        animlist_path = workdir / "animlist.txt"
+        animlist_path.write_text(",".join(seq.qc_name for seq in sequences), encoding="utf-8")
+        print(f"== Wrote: {animlist_path.name} (debug)")
 
     # 5) Rewrite materials in ALL mesh SMDs
     print("== Rewriting SMD material names ==")
     stems_needed: Set[str] = set()
     total_replaced = 0
-
     for mp in mesh_paths:
         replaced, stems = rewrite_smd_materials(mp, modelname, prefix=args.material_prefix)
         total_replaced += replaced
@@ -550,8 +599,8 @@ def main() -> int:
 
     print(f"== Material lines rewritten: {total_replaced} ==")
 
-    # 5b) Strip root XY (in-place animations) — on by default, disable with --no-inplace
-    if not args.no_inplace:
+    # 5b) Strip root XY (in-place animations) — off by default
+    if args.inplace:
         print("== Making animations in-place (strip root XY) ==")
         for anim_path in set(anim_paths):
             strip_root_xy(anim_path)
@@ -562,38 +611,61 @@ def main() -> int:
         print(f"== Staging textures to content root: {content_root} ==")
         stage_textures_as_png(workdir, content_root, modelname, stems_needed)
 
-    # 7) Generate framegroups (based on QC order + anim SMD frame counts)
+    # 7) Generate framegroups data (based on QC order + anim SMD frame counts)
+    framegroup_entries: List[Tuple[int, int, int, int]] = []
     if sequences:
-        print("== Generating framegroups ==")
+        print("== Generating framegroups data ==")
         start = 0
-        entries: List[Tuple[int, int, int, int]] = []
 
         for seq, anim_path in zip(sequences, anim_paths):
             frames = count_smd_frames(anim_path)
-            entries.append((start, frames, seq.fps, seq.loop))
+            framegroup_entries.append((start, frames, seq.fps, seq.loop))
             start += frames
-
-        framegroups_path = out_path.with_suffix(out_path.suffix + ".framegroups")  # <name>.iqm.framegroups
-        write_framegroups(framegroups_path, entries)
-        print(f"== Wrote: {framegroups_path} ==")
     else:
-        print("== Skipping framegroups (no sequences) ==")
+        print("== Skipping framegroups data (no sequences) ==")
 
-    # 8) Run iqm tool: multi-mesh, with fallback merge if requested
+    # 8) Run iqm tool
     print("== Building IQM ==")
-    cmd = [str(iqm_exe), "-r", args.rotate, str(out_path)]
-    cmd += [str(p) for p in mesh_paths]
-    cmd += [str(p) for p in anim_paths]
-    p = run_cmd(cmd, check=False)
+    split_per_submodel = args.split_per_submodel and len(mesh_paths) > 1
+    built_iqms: List[Path] = []
 
-    if len(mesh_paths) > 1:
-        print("== Attempting mesh merge and retry ==")
-        merged_mesh = workdir / f"{modelname}__merged_mesh.smd"
-        merge_mesh_smds(mesh_paths, merged_mesh, strict=not args.force_merge_meshes)
+    if split_per_submodel:
+        split_paths = numbered_iqm_outputs(out_path, len(mesh_paths))
+        print(f"== Splitting into {len(split_paths)} IQM files (one per submodel) ==")
 
-        cmd2 = [str(iqm_exe), "-r", args.rotate, str(out_path), str(merged_mesh)]
-        cmd2 += [str(p) for p in anim_paths]
-        run_cmd(cmd2, check=True)
+        for mesh_path, split_path in zip(mesh_paths, split_paths):
+            print(f"== Building split IQM: {split_path.name} from {mesh_path.name} ==")
+            if framegroup_entries:
+                framegroups_path = split_path.with_suffix(split_path.suffix + ".framegroups")
+                write_framegroups(framegroups_path, framegroup_entries)
+                print(f"== Wrote: {framegroups_path} ==")
+
+            build_iqm(
+                iqm_exe=iqm_exe,
+                rotate=args.rotate,
+                out_path=split_path,
+                mesh_paths=[mesh_path],
+                anim_paths=anim_paths,
+                workdir=workdir,
+                modelname=modelname,
+            )
+            built_iqms.append(split_path)
+    else:
+        if framegroup_entries:
+            framegroups_path = out_path.with_suffix(out_path.suffix + ".framegroups")  # <name>.iqm.framegroups
+            write_framegroups(framegroups_path, framegroup_entries)
+            print(f"== Wrote: {framegroups_path} ==")
+
+        build_iqm(
+            iqm_exe=iqm_exe,
+            rotate=args.rotate,
+            out_path=out_path,
+            mesh_paths=mesh_paths,
+            anim_paths=anim_paths,
+            workdir=workdir,
+            modelname=modelname,
+        )
+        built_iqms.append(out_path)
 
 
     # 9) Move final outputs into content root (optional)
@@ -601,11 +673,14 @@ def main() -> int:
         content_root = Path(args.content_root).resolve()
         print(f"== Moving outputs to content root: {content_root} ==")
 
-        new_iqm, new_fg = move_outputs_to_content_root(out_path, content_root, modelname)
+        for built_iqm in built_iqms:
+            new_iqm, new_fg = move_outputs_to_content_root(built_iqm, content_root, modelname)
 
-        print(f"== IQM moved to: {new_iqm} ==")
-        if new_fg.exists():
-            print(f"== Framegroups moved to: {new_fg} ==")
+            print(f"== IQM moved to: {new_iqm} ==")
+            if new_fg.exists():
+                print(f"== Framegroups moved to: {new_fg} ==")
+
+
 
     print("DONE.")
     return 0
