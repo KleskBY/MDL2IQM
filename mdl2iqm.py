@@ -604,6 +604,38 @@ def write_framegroups(out_framegroups: Path, entries: List[Tuple[int, int, int, 
 
 
 # ----------------------------
+# events writer (HL mstudioevent_t -> QC-readable sidecar)
+# ----------------------------
+
+def write_events(out_events: Path, entries: List[Tuple[int, int, int, int, str]],
+                 info: "mdlinfo.MdlInfo") -> bool:
+    """
+    Emit <model>.iqm.events: one line per anim event, QC tokenize-friendly:
+
+      groupname time_seconds event_code options
+
+    groupname matches the .framegroups 5th column (sanitized). time is the
+    event's frame divided by the sequence fps. options is '-' when empty
+    (QC needs a fixed token count). Returns False (and writes nothing) when
+    no sequence carries events.
+    """
+    lines: List[str] = []
+    for (_start, _count, fps, _loop, name) in entries:
+        seq = info.sequence_by_label(name)
+        if not seq or not seq.events:
+            continue
+        use_fps = fps if fps > 0 else (seq.fps if seq.fps > 0 else 15)
+        for ev in seq.events:
+            t = ev.frame / use_fps
+            opts = sanitize_token(ev.options) if ev.options else "-"
+            lines.append(f"{sanitize_token(name)} {t:.3f} {ev.event} {opts}\n")
+    if not lines:
+        return False
+    out_events.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+# ----------------------------
 # Bodygroups: skin files + bodyinfo sidecar
 # ----------------------------
 
@@ -674,7 +706,7 @@ def write_skin_files(
                         # break engine .skin parsing / shader lookup — the
                         # staged PNGs use the same sanitized names
                         stem = sanitize_mesh_token(remap.get(tex_stem, tex_stem))
-                        lines.append(f"{mesh_name},{prefix}/{modelname}/{stem}.png")
+                        lines.append(f"{mesh_name},{prefix}/{modelname}/{stem}")
                     else:
                         lines.append(f"{mesh_name},common/nodraw")
 
@@ -908,7 +940,7 @@ def move_outputs_to_content_root(
 
     shutil.move(str(iqm_path), new_iqm)
 
-    for sidecar_suffix in (".framegroups", ".bodyinfo"):
+    for sidecar_suffix in (".framegroups", ".bodyinfo", ".events"):
         sc = iqm_path.with_name(iqm_path.name + sidecar_suffix)
         if sc.exists():
             shutil.move(str(sc), models_dir / sc.name)
@@ -1219,6 +1251,9 @@ def main() -> int:
                 framegroups_path = split_path.with_suffix(split_path.suffix + ".framegroups")
                 write_framegroups(framegroups_path, framegroup_entries)
                 print(f"== Wrote: {framegroups_path} ==")
+                events_path = split_path.with_suffix(split_path.suffix + ".events")
+                if write_events(events_path, framegroup_entries, info):
+                    print(f"== Wrote: {events_path} ==")
 
             build_iqm(
                 iqm_exe=iqm_exe,
@@ -1235,6 +1270,9 @@ def main() -> int:
             framegroups_path = out_path.with_suffix(out_path.suffix + ".framegroups")  # <name>.iqm.framegroups
             write_framegroups(framegroups_path, framegroup_entries)
             print(f"== Wrote: {framegroups_path} ==")
+            events_path = out_path.with_suffix(out_path.suffix + ".events")  # <name>.iqm.events
+            if write_events(events_path, framegroup_entries, info):
+                print(f"== Wrote: {events_path} ==")
 
         build_iqm(
             iqm_exe=iqm_exe,

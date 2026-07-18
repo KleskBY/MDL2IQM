@@ -44,6 +44,13 @@ def _cstr(b: bytes) -> str:
 
 
 @dataclass
+class MdlEvent:
+    frame: int
+    event: int      # SCRIPT_EVENT_* (1000+) or monster-specific (<1000)
+    options: str    # wav path / sentence / target name, often empty
+
+
+@dataclass
 class MdlSequence:
     label: str
     fps: float
@@ -51,6 +58,7 @@ class MdlSequence:
     numframes: int
     motiontype: int
     linearmovement: tuple  # (x, y, z) total root displacement over sequence
+    events: List["MdlEvent"] = field(default_factory=list)
 
     @property
     def motion_axes(self) -> List[int]:
@@ -130,6 +138,8 @@ class MdlInfo:
 _HDR = struct.Struct("<2i64si15f27i")
 # mstudioseqdesc_t (studio.h:164), 176 bytes
 _SEQ = struct.Struct("<32sf10i3f2i6f2i2i2f2f6i")
+# mstudioevent_t (studio.h:194): frame, event, type, options[64]
+_EVENT = struct.Struct("<3i64s")
 # mstudiobodyparts_t (studio.h:257), 76 bytes
 _BODYPART = struct.Struct("<64s3i")
 # mstudiomodel_t (studio.h:282), 112 bytes
@@ -173,13 +183,20 @@ def parse_mdl(path: Path, _allow_tfile: bool = True) -> MdlInfo:
         seqflags = s[2]
         # after fps: flags activity actweight numevents eventindex numframes
         #            numpivots pivotindex motiontype motionbone
+        numevents = s[5]
+        eventindex = s[6]
         numframes = s[7]
         motiontype = s[10]
         linearmovement = (s[12], s[13], s[14])
+        events = []
+        for j in range(numevents):
+            ef, ecode, _etype, eopts = _EVENT.unpack_from(
+                data, eventindex + j * _EVENT.size)
+            events.append(MdlEvent(frame=ef, event=ecode, options=_cstr(eopts)))
         info.sequences.append(MdlSequence(
             label=label, fps=fps, looping=bool(seqflags & STUDIO_LOOPING),
             numframes=numframes, motiontype=motiontype,
-            linearmovement=linearmovement))
+            linearmovement=linearmovement, events=events))
 
     for i in range(numbodyparts):
         bname, nummodels, base, modelindex = _BODYPART.unpack_from(
@@ -236,3 +253,5 @@ if __name__ == "__main__":
                          if s.motiontype & bit) or "-"
         print(f"  {s.label:24s} frames={s.numframes:4d} fps={s.fps:5.1f} "
               f"loop={int(s.looping)} motion={motion} lm=({lm[0]:.1f},{lm[1]:.1f},{lm[2]:.1f})")
+        for e in s.events:
+            print(f"      event {e.event} @frame {e.frame} opts='{e.options}'")
