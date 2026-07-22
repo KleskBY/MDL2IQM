@@ -175,6 +175,75 @@ def smd_is_material_line(line: str) -> bool:
     return True
 
 
+def parse_smd_nodes(smd_path: Path) -> List[Tuple[int, str, int]]:
+    """Reads the `nodes` block: (id, name, parent) in file order."""
+    node_re = re.compile(r'^\s*(-?\d+)\s+"([^"]*)"\s+(-?\d+)\s*$')
+    nodes: List[Tuple[int, str, int]] = []
+    in_nodes = False
+    for raw in smd_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = raw.strip().lower()
+        if stripped == "nodes":
+            in_nodes = True
+            continue
+        if in_nodes:
+            if stripped == "end":
+                break
+            m = node_re.match(raw)
+            if m:
+                nodes.append((int(m.group(1)), m.group(2), int(m.group(3))))
+    return nodes
+
+
+def _is_lower_body_bone(name: str) -> bool:
+    n = name.lower()
+    return (n == "bip01" or "pelvis" in n
+            or "leg" in n or "foot" in n or "toe" in n)
+
+
+def detect_split_bone(nodes: List[Tuple[int, str, int]]) -> Optional[Tuple[int, str]]:
+    """
+    Finds the first torso bone (legs/torso boundary) for the QC-side
+    upper/lower body split. Emitted as `splitbone <id> <name>` in .bodyinfo:
+    the id is the 0-based SMD/IQM joint index — QC owns any engine ±1.
+
+    Requires a legs-first skeleton (root, pelvis, leg chains, then torso).
+    Returns None (with a loud warning) when the ordering doesn't hold —
+    a reorder pass is future work; today's HL biped rigs are all legs-first.
+    """
+    if not nodes:
+        return None
+
+    by_name = {name.lower(): (bid, name) for bid, name, _ in nodes}
+    split = by_name.get("bip01 spine")
+    if split is None:
+        # fallback: first non-leg child of the pelvis
+        pelvis_ids = {bid for bid, name, _ in nodes if "pelvis" in name.lower()}
+        for bid, name, parent in nodes:
+            if parent in pelvis_ids and "leg" not in name.lower():
+                split = (bid, name)
+                break
+    if split is None:
+        print("!! splitbone: no 'Bip01 Spine' or non-leg pelvis child found; not emitted")
+        return None
+
+    sid, sname = split
+    bad_low = [name for bid, name, _ in nodes if bid < sid and not _is_lower_body_bone(name)]
+    bad_high = [name for bid, name, _ in nodes
+                if bid >= sid and ("leg" in name.lower() or "foot" in name.lower()
+                                   or "toe" in name.lower())]
+    if bad_low or bad_high:
+        print("!! splitbone: skeleton is not legs-first; splitbone not emitted "
+              "(reorder pass = future work)")
+        for n in bad_low[:8]:
+            print(f"   - non-leg bone below split: {n}")
+        for n in bad_high[:8]:
+            print(f"   - leg bone above split: {n}")
+        return None
+
+    print(f"== splitbone: {sid} \"{sname}\" (legs = bones 0..{sid - 1}) ==")
+    return sid, sname
+
+
 def offset_root_bone(smd_path: Path, dx: float, dy: float, dz: float) -> None:
     """
     Modifies SMD in-place: bone 0 (root) X/Y/Z are shifted by (dx, dy, dz)
@@ -675,6 +744,7 @@ def write_skin_files(
     info: mdlinfo.MdlInfo,
     modelname: str,
     prefix: str,
+    mesh_filter: Optional[Set[str]] = None,
 ) -> List[Path]:
     """
     Emits <out_iqm.name>_<i>.skin next to out_iqm for every body×family
@@ -682,6 +752,9 @@ def write_skin_files(
     Body_Apply). Every IQM mesh is listed (DP renders unlisted meshes as
     checkerboard): visible submodels point at their (family-remapped)
     texture, hidden submodels at common/nodraw.
+
+    mesh_filter: when set (--split-body halves), only meshes named in the
+    set are listed — each half's skin file addresses its own IQM.
     """
     total_combos = 1
     for g in groups:
@@ -701,6 +774,8 @@ def write_skin_files(
             for sm in submodels:
                 visible = chosen[sm.group_index] == sm.submodel_index
                 for mesh_name, tex_stem in sm.meshes:
+                    if mesh_filter is not None and mesh_name not in mesh_filter:
+                        continue
                     if visible:
                         # sanitized: HL texture names carry parens etc. that
                         # break engine .skin parsing / shader lookup — the
@@ -725,14 +800,18 @@ def write_bodyinfo(
     bases: List[int],
     info: mdlinfo.MdlInfo,
     sequences: List[QcSequence],
+    splitbone: Optional[Tuple[int, str]] = None,
 ) -> Path:
     """
     Sidecar consumed by QC (BodyInfo_Load in serverqc/util_body.qc):
       families <numfamilies>
+      splitbone <id> <name>          (0-based joint id of first TORSO bone)
       group <name> <count> <base>
       anim <name> <lm_x> <lm_y> <lm_z>
     """
     lines = [f"families {info.numskinfamilies}"]
+    if splitbone is not None:
+        lines.append(f"splitbone {splitbone[0]} {sanitize_token(splitbone[1])}")
     for g, base in zip(groups, bases):
         lines.append(f"group {sanitize_token(g.name)} {max(1, len(g.studios))} {base}")
     for seq in sequences:
@@ -836,6 +915,258 @@ def stage_textures_as_png(
 
     print(f"== Textures staged to: {dest_dir} ({copied} copied) ==")
     return copied
+
+
+# ----------------------------
+# IQM feet-height measurement (--feet-z)
+# ----------------------------
+# Minimal IQM v2 reader: skins every vertex at a given animation frame and
+# returns the global minimum Z. Used to place the model's animated standing
+# feet exactly at the hull floor (Quake player hull: -24) instead of trusting
+# a hand-tuned --offset constant.
+
+def _quat_to_mat3(x: float, y: float, z: float, w: float) -> List[List[float]]:
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def _mat34_compose(t, q, s) -> List[List[float]]:
+    r = _quat_to_mat3(*q)
+    return [[r[i][0] * s[0], r[i][1] * s[1], r[i][2] * s[2], t[i]] for i in range(3)]
+
+
+def _mat34_mul(a, b) -> List[List[float]]:
+    return [
+        [
+            a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]
+            + (a[i][3] if j == 3 else 0.0)
+            for j in range(4)
+        ]
+        for i in range(3)
+    ]
+
+
+def _mat34_invert(m) -> List[List[float]]:
+    a, b, c = m[0][0], m[0][1], m[0][2]
+    d, e, f = m[1][0], m[1][1], m[1][2]
+    g, h, i = m[2][0], m[2][1], m[2][2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) < 1e-12:
+        det = 1e-12
+    inv3 = [
+        [(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+        [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+        [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det],
+    ]
+    tx, ty, tz = m[0][3], m[1][3], m[2][3]
+    return [
+        inv3[r][:3] + [-(inv3[r][0] * tx + inv3[r][1] * ty + inv3[r][2] * tz)]
+        for r in range(3)
+    ]
+
+
+def measure_animated_feet_z(iqm_path: Path, frame_index: int = 0) -> float:
+    """Skins all vertices at global animation frame `frame_index` (post
+    `-r` rotation, i.e. final engine space) and returns the minimum Z."""
+    import struct
+
+    data = iqm_path.read_bytes()
+    if data[:16] != b"INTERQUAKEMODEL\x00":
+        raise RuntimeError(f"Not an IQM file: {iqm_path}")
+    hdr = struct.unpack_from("<27I", data, 16)
+    (_version, _filesize, _flags, _num_text, _ofs_text, _num_meshes, _ofs_meshes,
+     num_vertexarrays, num_vertexes, ofs_vertexarrays, _num_triangles, _ofs_triangles,
+     _ofs_adjacency, num_joints, ofs_joints, num_poses, ofs_poses, _num_anims,
+     _ofs_anims, num_frames, num_framechannels, ofs_frames, _ofs_bounds,
+     _num_comment, _ofs_comment, _num_ext, _ofs_ext) = hdr
+
+    if num_joints == 0:
+        raise RuntimeError("IQM has no joints")
+
+    # joints: bind pose
+    joints = []
+    for j in range(num_joints):
+        vals = struct.unpack_from("<Ii10f", data, ofs_joints + j * 48)
+        parent = vals[1]
+        t = vals[2:5]
+        q = vals[5:9]   # x y z w
+        s = vals[9:12]
+        joints.append((parent, t, q, s))
+
+    bind_world: List[List[List[float]]] = []
+    for parent, t, q, s in joints:
+        local = _mat34_compose(t, q, s)
+        bind_world.append(_mat34_mul(bind_world[parent], local) if parent >= 0 else local)
+    inv_bind = [_mat34_invert(m) for m in bind_world]
+
+    # poses + frame data -> animated world matrices at frame_index
+    if num_poses and num_frames:
+        frame_index = max(0, min(frame_index, num_frames - 1))
+        poses = []
+        for p in range(num_poses):
+            vals = struct.unpack_from("<iI20f", data, ofs_poses + p * 88)
+            poses.append((vals[0], vals[1], vals[2:12], vals[12:22]))
+        fofs = ofs_frames + frame_index * num_framechannels * 2
+        fdata = struct.unpack_from(f"<{num_framechannels}H", data, fofs)
+        k = 0
+        anim_world: List[List[List[float]]] = []
+        for parent, mask, coffset, cscale in poses:
+            ch = []
+            for c in range(10):
+                v = coffset[c]
+                if mask & (1 << c):
+                    v += cscale[c] * fdata[k]
+                    k += 1
+                ch.append(v)
+            local = _mat34_compose(ch[0:3], ch[3:7], ch[7:10])
+            anim_world.append(_mat34_mul(anim_world[parent], local) if parent >= 0 else local)
+    else:
+        anim_world = bind_world
+
+    skin_mats = [_mat34_mul(anim_world[j], inv_bind[j]) for j in range(num_joints)]
+
+    # vertex arrays
+    IQM_POSITION, IQM_BLENDINDEXES, IQM_BLENDWEIGHTS = 0, 4, 5
+    pos_arr = idx_arr = wgt_arr = None
+    for a in range(num_vertexarrays):
+        vtype, _vflags, vformat, vsize, vofs = struct.unpack_from(
+            "<5I", data, ofs_vertexarrays + a * 20)
+        if vtype == IQM_POSITION:
+            pos_arr = (vformat, vsize, vofs)
+        elif vtype == IQM_BLENDINDEXES:
+            idx_arr = (vformat, vsize, vofs)
+        elif vtype == IQM_BLENDWEIGHTS:
+            wgt_arr = (vformat, vsize, vofs)
+    if pos_arr is None:
+        raise RuntimeError("IQM has no position vertex array")
+
+    minz = None
+    pofs = pos_arr[2]
+    for v in range(num_vertexes):
+        px, py, pz = struct.unpack_from("<3f", data, pofs + v * 12)
+        if idx_arr is not None and wgt_arr is not None:
+            bidx = struct.unpack_from("<4B", data, idx_arr[2] + v * 4)
+            bwgt = struct.unpack_from("<4B", data, wgt_arr[2] + v * 4)
+            z = 0.0
+            total = 0.0
+            for bi, bw in zip(bidx, bwgt):
+                if bw == 0:
+                    continue
+                w = bw / 255.0
+                m = skin_mats[bi]
+                z += w * (m[2][0] * px + m[2][1] * py + m[2][2] * pz + m[2][3])
+                total += w
+            if total <= 0.0:
+                m = skin_mats[bidx[0]]
+                z = m[2][0] * px + m[2][1] * py + m[2][2] * pz + m[2][3]
+        else:
+            m = skin_mats[0]
+            z = m[2][0] * px + m[2][1] * py + m[2][2] * pz + m[2][3]
+        if minz is None or z < minz:
+            minz = z
+
+    if minz is None:
+        raise RuntimeError("IQM has no vertices")
+    return minz
+
+
+# ----------------------------
+# Body-half mesh splitting (--split-body)
+# ----------------------------
+# Emits <name>_legs.iqm / <name>_torso.iqm for the DP/Zircon two-entity
+# player split: full skeleton + full anim set in both (identical framegroup
+# indices), meshes partitioned per-TRIANGLE by dominant vertex bone weight.
+# Triangles straddling the boundary go into BOTH halves — a co-planar
+# overlap ring that hides the waist seam.
+
+def smd_vertex_primary_bone(vert_line: str) -> int:
+    """Dominant-weight bone of an SMD triangle vertex line:
+    <bone> px py pz nx ny nz u v [numlinks (<bone> <weight>)*]
+    Unlisted remainder weight belongs to the leading <bone>."""
+    toks = vert_line.split()
+    base = int(toks[0])
+    if len(toks) < 10:
+        return base
+    try:
+        nlinks = int(toks[9])
+    except ValueError:
+        return base
+    pairs = []
+    total = 0.0
+    for i in range(nlinks):
+        try:
+            b = int(toks[10 + i * 2])
+            w = float(toks[11 + i * 2])
+        except (IndexError, ValueError):
+            break
+        pairs.append((b, w))
+        total += w
+    if total < 1.0 - 1e-4:
+        pairs.append((base, 1.0 - total))
+    if not pairs:
+        return base
+    return max(pairs, key=lambda p: p[1])[0]
+
+
+def split_mesh_smd(merged_mesh: Path, splitbone: int,
+                   legs_out: Path, torso_out: Path) -> Tuple[Set[str], Set[str]]:
+    """Partitions a (material-rewritten) mesh SMD at `splitbone` (0-based;
+    legs = bones < splitbone). Header (nodes + skeleton + 'triangles') is
+    copied verbatim into both halves. Returns (legs_meshes, torso_meshes):
+    the material/mesh names present in each half."""
+    header, tri = split_smd_sections(merged_mesh)
+
+    legs_lines: List[str] = []
+    torso_lines: List[str] = []
+    legs_meshes: Set[str] = set()
+    torso_meshes: Set[str] = set()
+    n_legs = n_torso = n_both = 0
+
+    i = 0
+    while i < len(tri):
+        mat = tri[i]
+        if not smd_is_material_line(mat):
+            raise RuntimeError(
+                f"split_mesh_smd: expected material line at triangle {i}: {mat.strip()!r}")
+        if i + 4 > len(tri):
+            raise RuntimeError("split_mesh_smd: truncated triangle block")
+        verts = tri[i + 1:i + 4]
+        legs_votes = sum(1 for v in verts if smd_vertex_primary_bone(v) < splitbone)
+
+        mat_name = mat.strip()
+        if legs_votes == 3:
+            legs_lines += [mat] + verts
+            legs_meshes.add(mat_name)
+            n_legs += 1
+        elif legs_votes == 0:
+            torso_lines += [mat] + verts
+            torso_meshes.add(mat_name)
+            n_torso += 1
+        else:
+            legs_lines += [mat] + verts
+            torso_lines += [mat] + verts
+            legs_meshes.add(mat_name)
+            torso_meshes.add(mat_name)
+            n_both += 1
+        i += 4
+
+    if n_legs == 0 or n_torso == 0:
+        raise RuntimeError(
+            f"split_mesh_smd: degenerate split (legs {n_legs}, torso {n_torso}) "
+            f"— wrong splitbone {splitbone}?")
+
+    legs_out.write_text("".join(header) + "".join(legs_lines) + "end\n",
+                        encoding="utf-8", errors="ignore")
+    torso_out.write_text("".join(header) + "".join(torso_lines) + "end\n",
+                         encoding="utf-8", errors="ignore")
+    print(f"== split-body: {n_legs} legs / {n_torso} torso / {n_both} overlap "
+          f"triangle(s) at splitbone {splitbone} ==")
+    return legs_meshes, torso_meshes
 
 
 # ----------------------------
@@ -1009,6 +1340,18 @@ def main() -> int:
                          "(shifts entire skeleton+mesh; default: 0,0,0). Applied in source-MDL "
                          "coordinates BEFORE the iqm '-r rotate'. For HL models with the default "
                          "rotate '0,0,90', the Z axis stays Z.")
+    ap.add_argument("--feet-z", type=float, default=None,
+                    help="Target Z (final engine space) for the model's animated standing "
+                         "feet, e.g. -24 for the Quake player hull. After the first build the "
+                         "idle-frame feet height is measured by skinning the IQM; the root "
+                         "bone is shifted by the difference and the IQM rebuilt. Overrides "
+                         "guesswork --offset Z constants.")
+    ap.add_argument("--split-body", action="store_true",
+                    help="Additionally emit <name>_legs.iqm and <name>_torso.iqm: meshes "
+                         "partitioned per-triangle at the detected splitbone (dominant "
+                         "vertex weight), full skeleton + all anims in both, boundary "
+                         "triangles duplicated into both halves (seam-hiding overlap ring). "
+                         "For the DP/Zircon two-entity player split.")
     ap.add_argument("--keep-work", action="store_true", help="Do not wipe workdir before running")
     ap.add_argument("--delete-original-textures", action="store_true", help="After PNG conversion, delete non-PNG extracted textures")
 
@@ -1120,6 +1463,10 @@ def main() -> int:
         if sm.stem and sm.stem.lower() not in mesh_paths_by_stem:
             mesh_paths_by_stem[sm.stem.lower()] = resolve_file_recursive(workdir, sm.stem + ".smd")
     mesh_paths = list(mesh_paths_by_stem.values())
+
+    # Legs/torso boundary for the QC upper/lower body split (emitted into
+    # .bodyinfo; also gates --split-body)
+    splitbone = detect_split_bone(parse_smd_nodes(mesh_paths[0])) if mesh_paths else None
 
     # Resolve anim SMDs; flatten multi-blend sequences to a single anim baked
     # at blend value 0deg (HLMV behavior) unless disabled.
@@ -1285,12 +1632,101 @@ def main() -> int:
         )
         built_iqms.append(out_path)
 
+        # 8a) Measured feet-Z correction: skin the built IQM at the idle
+        # frame, shift the root by the miss, rebuild once. Runs BEFORE the
+        # body-half split so the halves inherit the corrected offset.
+        if args.feet_z is not None:
+            rot = [float(v) for v in args.rotate.split(",")]
+            if rot[0] != 0.0 or rot[1] != 0.0:
+                print("!! --feet-z assumes a Z-preserving --rotate (yaw only); "
+                      f"got {args.rotate} — measurement may be wrong")
+            idle_frame = 0
+            for (fg_start, _c, _f, _l, fg_name) in framegroup_entries:
+                if fg_name == "idle":
+                    idle_frame = fg_start
+                    break
+            measured = measure_animated_feet_z(out_path, idle_frame)
+            if abs(measured - args.feet_z) > 0.5:
+                dzz = args.feet_z - measured
+                print(f"== feet-z: measured {measured:.2f}, target {args.feet_z:g} "
+                      f"-> shifting anim roots by {dzz:+.2f} and rebuilding ==")
+                # ANIM SMDs only. Skinning is animPose * inverse(bindPose):
+                # shifting the mesh (bind) skeleton along with the anims
+                # cancels out exactly — the historical --offset 0,0,24 was a
+                # no-op for on-screen placement for this very reason.
+                for anim_path in set(anim_paths):
+                    offset_root_bone(anim_path, 0.0, 0.0, dzz)
+                build_iqm(
+                    iqm_exe=iqm_exe,
+                    rotate=args.rotate,
+                    out_path=out_path,
+                    mesh_paths=mesh_paths,
+                    anim_paths=anim_paths,
+                    workdir=workdir,
+                    modelname=modelname,
+                )
+                remeasured = measure_animated_feet_z(out_path, idle_frame)
+                print(f"== feet z: {measured:.2f} -> {remeasured:.2f} "
+                      f"(target {args.feet_z:g}) ==")
+                if abs(remeasured - args.feet_z) > 0.5:
+                    raise RuntimeError(
+                        f"--feet-z correction missed (got {remeasured:.2f}, "
+                        f"wanted {args.feet_z:g}) — feet not root-driven?")
+            else:
+                print(f"== feet z: {measured:.2f} already at target {args.feet_z:g} ==")
+
         # 8b) Bodygroup skin files + bodyinfo sidecar
+        bases = compute_group_bases(groups, info)
         if bodygroup_mode:
-            bases = compute_group_bases(groups, info)
             write_skin_files(out_path, groups, bases, submodels, info,
                              modelname, args.material_prefix)
-            write_bodyinfo(out_path, groups, bases, info, sequences)
+            write_bodyinfo(out_path, groups, bases, info, sequences, splitbone)
+        elif splitbone is not None:
+            # minimal sidecar: QC needs the splitbone even without bodygroups
+            write_bodyinfo(out_path, groups, bases, info, sequences, splitbone)
+
+        # 8c) Body-half split (DP/Zircon two-entity player)
+        if args.split_body:
+            if splitbone is None:
+                print("!! --split-body requested but no splitbone detected; skipping halves")
+            else:
+                print("== Building body-half IQMs (--split-body) ==")
+                split_src = workdir / f"{modelname}__splitsrc.smd"
+                merge_mesh_smds(mesh_paths, split_src, strict=False)
+                legs_smd = workdir / f"{modelname}__legs_mesh.smd"
+                torso_smd = workdir / f"{modelname}__torso_mesh.smd"
+                legs_meshes, torso_meshes = split_mesh_smd(
+                    split_src, splitbone[0], legs_smd, torso_smd)
+
+                halves = (
+                    (out_path.with_name(f"{out_path.stem}_legs{out_path.suffix}"),
+                     legs_smd, legs_meshes),
+                    (out_path.with_name(f"{out_path.stem}_torso{out_path.suffix}"),
+                     torso_smd, torso_meshes),
+                )
+                for half_path, half_smd, half_meshes in halves:
+                    if framegroup_entries:
+                        write_framegroups(
+                            half_path.with_suffix(half_path.suffix + ".framegroups"),
+                            framegroup_entries)
+                        write_events(
+                            half_path.with_suffix(half_path.suffix + ".events"),
+                            framegroup_entries, info)
+                    build_iqm(
+                        iqm_exe=iqm_exe,
+                        rotate=args.rotate,
+                        out_path=half_path,
+                        mesh_paths=[half_smd],
+                        anim_paths=anim_paths,
+                        workdir=workdir,
+                        modelname=modelname,
+                    )
+                    if bodygroup_mode:
+                        write_skin_files(half_path, groups, bases, submodels, info,
+                                         modelname, args.material_prefix,
+                                         mesh_filter=half_meshes)
+                    write_bodyinfo(half_path, groups, bases, info, sequences, splitbone)
+                    built_iqms.append(half_path)
 
     # 9) Move final outputs into content root (optional)
     if args.content_root:
