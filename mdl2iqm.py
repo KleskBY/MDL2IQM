@@ -1533,11 +1533,20 @@ def main() -> int:
         # they survive its label de-duping, e.g. binary "run"x3 -> run_1..3);
         # fall back to matching the MDL binary label. Axes are measured, so
         # the union set only gates.
+        # Player-only (gated on --feet-z): HL bakes large forward root motion
+        # into jump/long_jump for the leap. Unlike run/walk it carries no
+        # STUDIO_LX flag, so it survives extraction and the mesh slides forward
+        # on top of the physics velocity. Force-strip the horizontal drift.
+        jump_strip = {"jump", "long_jump"} if args.feet_z is not None else set()
         axes_by_path: Dict[Path, Set[int]] = {}
         for seq, apath in zip(sequences, anim_paths):
             s = info.sequence_by_label(seq.qc_name)
+            axes: Set[int] = set()
             if seq.has_motion or (s and s.motion_axes):
                 axes = set(s.motion_axes) if (s and s.motion_axes) else {0, 1, 2}
+            if seq.qc_name in jump_strip:
+                axes |= {0, 1}   # X/Y drift only — keep any vertical arc
+            if axes:
                 axes_by_path.setdefault(apath, set()).update(axes)
         for apath, axes in axes_by_path.items():
             extract_linear_motion(apath, axes)
@@ -1674,6 +1683,34 @@ def main() -> int:
                         f"wanted {args.feet_z:g}) — feet not root-driven?")
             else:
                 print(f"== feet z: {measured:.2f} already at target {args.feet_z:g} ==")
+
+            # 8a2) Crouch feet planting. Crouch/crawl anims squat the root
+            # toward the feet, so with the root pinned to the entity origin
+            # they render well above the floor (--feet-z only calibrated
+            # 'idle'). Measure the crouch feet and shift the WHOLE crouch
+            # family (legs crouch_idle/crawl AND the paired torso
+            # crouch_aim_*/crouch_shoot_*) down by the same amount, so the
+            # feet reach the ground and the two-entity waist stays aligned.
+            crouch_start = None
+            for (fg_start, _c, _f, _l, fg_name) in framegroup_entries:
+                if fg_name == "crouch_idle":
+                    crouch_start = fg_start
+                    break
+            if crouch_start is not None:
+                cz = measure_animated_feet_z(out_path, crouch_start)
+                cdelta = args.feet_z - cz
+                if abs(cdelta) > 0.5:
+                    fam = {apath for seq, apath in zip(sequences, anim_paths)
+                           if seq.qc_name == "crawl" or seq.qc_name.startswith("crouch_")}
+                    print(f"== crouch plant: feet {cz:.2f} -> {args.feet_z:g}, shifting "
+                          f"{len(fam)} crouch-family anim(s) by {cdelta:+.2f} ==")
+                    for apath in fam:
+                        offset_root_bone(apath, 0.0, 0.0, cdelta)
+                    build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=out_path,
+                              mesh_paths=mesh_paths, anim_paths=anim_paths,
+                              workdir=workdir, modelname=modelname)
+                    rz = measure_animated_feet_z(out_path, crouch_start)
+                    print(f"== crouch feet: {cz:.2f} -> {rz:.2f} (target {args.feet_z:g}) ==")
 
         # 8b) Bodygroup skin files + bodyinfo sidecar
         bases = compute_group_bases(groups, info)
