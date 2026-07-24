@@ -1533,24 +1533,24 @@ def main() -> int:
         # they survive its label de-duping, e.g. binary "run"x3 -> run_1..3);
         # fall back to matching the MDL binary label. Axes are measured, so
         # the union set only gates.
-        # Player-only (gated on --feet-z): HL bakes large forward root motion
-        # into jump/long_jump for the leap. Unlike run/walk it carries no
-        # STUDIO_LX flag, so it survives extraction and the mesh slides forward
-        # on top of the physics velocity. Force-strip the horizontal drift.
         jump_strip = {"jump", "long_jump"} if args.feet_z is not None else set()
         axes_by_path: Dict[Path, Set[int]] = {}
         for seq, apath in zip(sequences, anim_paths):
             s = info.sequence_by_label(seq.qc_name)
-            axes: Set[int] = set()
             if seq.has_motion or (s and s.motion_axes):
                 axes = set(s.motion_axes) if (s and s.motion_axes) else {0, 1, 2}
-            if seq.qc_name in jump_strip:
-                axes |= {0, 1}   # X/Y drift only — keep any vertical arc
-            if axes:
                 axes_by_path.setdefault(apath, set()).update(axes)
         for apath, axes in axes_by_path.items():
             extract_linear_motion(apath, axes)
-        if not axes_by_path:
+        # Jumps (player-only, gated on --feet-z): HL bakes a big forward lunge
+        # with no STUDIO_LX flag. A linear-ramp subtraction leaves a non-linear
+        # residual — the model still drifts forward mid-leap then snaps back
+        # when the landing anim resets the root. Hard-lock root X/Y to frame 0
+        # so the leap stays centered on the collider (vertical arc untouched).
+        for seq, apath in zip(sequences, anim_paths):
+            if seq.qc_name in jump_strip:
+                strip_root_xy(apath)
+        if not axes_by_path and not jump_strip:
             print("   (no motion-flagged sequences)")
 
     # 5c) Root-bone offset — shifts the entire skeleton (and weighted mesh)
