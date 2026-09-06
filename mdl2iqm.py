@@ -1561,6 +1561,12 @@ def main() -> int:
     ap.add_argument("--no-bodygroups", action="store_true",
                     help="Ignore extra bodygroup submodels (old behavior: first studio of "
                          "each group only, no skin files).")
+    ap.add_argument("--skin-groups", default=None, metavar="NAME[,NAME...]",
+                    help="Only write .skin sidecars for models carrying one of these "
+                         "bodygroups (e.g. wpn_scope,wpn_silencer,wpn_upgrade). Default "
+                         "is to write them for every model with bodygroups or multiple "
+                         "skin families, since nothing in the MDL says which groups the "
+                         "game code drives. Models with >1 skin family always keep theirs.")
     ap.add_argument("--rename-anim", action="append", default=[], metavar="OLD=NEW",
                     help="Rename a $sequence before the IQM is built (source model names a "
                          "sequence differently than the game code asks for by name, e.g. "
@@ -1641,14 +1647,23 @@ def main() -> int:
                       and (info.total_body_combos > 1 or info.numskinfamilies > 1))
 
     # Skin files exist so QC can hide/show a bodygroup submodel at runtime
-    # (Body_SetGroup). Most bodygroups a converted character carries (head
-    # variants, gear) are never toggled in QC, so writing every body x family
-    # combo for them is pure noise. Only weapon attachment slots are actually
-    # driven at runtime today, so gate skin-file writing on those specifically
-    # rather than on "has any bodygroup at all". The mesh itself still bakes
-    # every submodel either way (bodygroup_mode) -- this only skips the sidecars.
-    _SKIN_GROUP_NAMES = ("wpn_upgrade", "wpn_silencer", "wpn_scope")
-    write_skins = bodygroup_mode and any(g.name.lower() in _SKIN_GROUP_NAMES for g in groups)
+    # (Body_SetGroup) and pick a skin family. Default is to write them for any
+    # model that has either, since there is no way to tell from the MDL which
+    # groups the game code will actually drive. --skin-groups narrows that to
+    # models carrying one of the named groups, for asset sets where most
+    # bodygroups are static dressing and the sidecars are pure noise. Skipping
+    # them never changes how a model renders untouched: it only removes the
+    # ability to switch. The mesh still bakes every submodel either way.
+    write_skins = bodygroup_mode
+    if bodygroup_mode and args.skin_groups:
+        wanted = {n.strip().lower() for n in args.skin_groups.split(",") if n.strip()}
+        write_skins = any(g.name.lower() in wanted for g in groups)
+        if not write_skins and info.numskinfamilies > 1:
+            # Families are not a bodygroup and cannot be named, so --skin-groups
+            # must not be what silently drops a model's skin variants.
+            print("== --skin-groups: keeping skin files anyway, model has "
+                  f"{info.numskinfamilies} skin families ==")
+            write_skins = True
 
     if args.no_bodygroups or args.split_per_submodel:
         # old behavior: first (non-blank) studio per group
@@ -1990,8 +2005,7 @@ def main() -> int:
                 write_skin_files(out_path, groups, bases, submodels, info,
                                  modelname, args.material_prefix)
             else:
-                print("== Skipping skin files: no wpn_upgrade/wpn_silencer/wpn_scope "
-                      "bodygroup, nothing toggles them at runtime ==")
+                print("== Skipping skin files: no bodygroup named by --skin-groups ==")
             write_bodyinfo(out_path, groups, bases, info, sequences, splitbone)
         elif splitbone is not None:
             # minimal sidecar: QC needs the splitbone even without bodygroups
