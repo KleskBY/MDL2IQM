@@ -73,6 +73,9 @@ class QcSequence:
     fps: int
     loop: int        # 1 if loop present else 0
     has_motion: bool = False  # LX/LY/LZ token on the $sequence line
+    # Name to look the MDL binary's motion flags up under, when this sequence
+    # has been renamed or duplicated and no longer matches its own label.
+    motion_src: str = ""
     blend_smds: List[str] = field(default_factory=list)  # ALL anim stems (>=1)
     blend_start: float = 0.0  # blend range from `blend XR <start> <end>`
     blend_end: float = 0.0
@@ -84,12 +87,60 @@ class QcBodyGroup:
     studios: List[str] = field(default_factory=list)  # smd stems, in QC order
 
 
+_seq_brace_open_re = re.compile(r'^\s*\$sequence\s+"([^"]+)"\s*\{\s*$', re.IGNORECASE)
+
+
+def _join_brace_sequences(lines: List[str]) -> List[str]:
+    """
+    Some decompiled QC (multi-blend grid poses, e.g. 3x3 aim blends) writes
+    $sequence as a brace block instead of one line:
+        $sequence "aim" {
+                  "aim_blend1"
+                  "aim_blend2"
+                  blend XR -90 90 fps 30 loop
+        }
+    seq_re (below) only matches the single-line form, so a block like this
+    silently vanishes from `sequences` with no error: the animation is just
+    never baked, and QC further down never mentions its absence either.
+    Flattening every such block to one line first (name, all quoted stems,
+    then the tail) lets the existing single-line regexes handle it unchanged.
+    A self-contained same-line sub-block (mdldec's per-frame event markers,
+    "{ event 5001 0 "40" }") nets to zero brace depth and does not end the
+    outer block early.
+    """
+    out: List[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        m = _seq_brace_open_re.match(lines[i])
+        if not m:
+            out.append(lines[i])
+            i += 1
+            continue
+
+        parts = [f'$sequence "{m.group(1)}"']
+        depth = 1
+        i += 1
+        while i < n and depth > 0:
+            line = lines[i]
+            depth += line.count("{") - line.count("}")
+            if depth == 0:
+                stripped = line.rstrip()
+                if stripped.endswith("}"):
+                    line = stripped[:-1]
+            if line.strip():
+                parts.append(line.strip())
+            i += 1
+        out.append(" ".join(parts))
+    return out
+
+
 def parse_qc(qc_path: Path) -> Tuple[List[QcBodyGroup], List[QcSequence]]:
     """
     Supports:
       $body "Name" "meshstem"                     -> its own group of one
       $bodygroup "x" { studio "a" studio "b" ... blank }
       $sequence "name" "animstem" fps 30 [loop]
+      $sequence "name" { "blend1" "blend2" ... blend XR a b fps 30 [loop] }
     Returns:
       groups: bodygroups in QC order, each with ALL studio stems
       sequences: list of QcSequence in QC order (not deduped)
@@ -111,7 +162,7 @@ def parse_qc(qc_path: Path) -> Tuple[List[QcBodyGroup], List[QcSequence]]:
     # case-sensitive: LX/LY/LZ motion-extraction tokens (mdldec re-emits them)
     motion_re = re.compile(r'\bL[XYZ]\b')
 
-    lines = qc_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = _join_brace_sequences(qc_path.read_text(encoding="utf-8", errors="ignore").splitlines())
     cur_group: Optional[QcBodyGroup] = None
 
     for raw in lines:
@@ -194,10 +245,20 @@ def parse_smd_nodes(smd_path: Path) -> List[Tuple[int, str, int]]:
     return nodes
 
 
+# Two real HL1 biped naming conventions show up across converted rigs: one
+# names the upper leg bone "Leg"/"Leg1", the other "Thigh"/"Calf". Recognize
+# both, everywhere a bone gets classified as leg-vs-torso.
+_LEG_KEYWORDS = ("leg", "thigh", "calf", "foot", "toe")
+
+
+def _is_leg_bone(name: str) -> bool:
+    n = name.lower()
+    return any(k in n for k in _LEG_KEYWORDS)
+
+
 def _is_lower_body_bone(name: str) -> bool:
     n = name.lower()
-    return (n == "bip01" or "pelvis" in n
-            or "leg" in n or "foot" in n or "toe" in n)
+    return n == "bip01" or "pelvis" in n or _is_leg_bone(name)
 
 
 def detect_split_bone(nodes: List[Tuple[int, str, int]]) -> Optional[Tuple[int, str]]:
@@ -219,7 +280,7 @@ def detect_split_bone(nodes: List[Tuple[int, str, int]]) -> Optional[Tuple[int, 
         # fallback: first non-leg child of the pelvis
         pelvis_ids = {bid for bid, name, _ in nodes if "pelvis" in name.lower()}
         for bid, name, parent in nodes:
-            if parent in pelvis_ids and "leg" not in name.lower():
+            if parent in pelvis_ids and not _is_leg_bone(name):
                 split = (bid, name)
                 break
     if split is None:
@@ -228,9 +289,7 @@ def detect_split_bone(nodes: List[Tuple[int, str, int]]) -> Optional[Tuple[int, 
 
     sid, sname = split
     bad_low = [name for bid, name, _ in nodes if bid < sid and not _is_lower_body_bone(name)]
-    bad_high = [name for bid, name, _ in nodes
-                if bid >= sid and ("leg" in name.lower() or "foot" in name.lower()
-                                   or "toe" in name.lower())]
+    bad_high = [name for bid, name, _ in nodes if bid >= sid and _is_leg_bone(name)]
     if bad_low or bad_high:
         print("!! splitbone: skeleton is not legs-first; splitbone not emitted "
               "(reorder pass = future work)")
@@ -242,6 +301,131 @@ def detect_split_bone(nodes: List[Tuple[int, str, int]]) -> Optional[Tuple[int, 
 
     print(f"== splitbone: {sid} \"{sname}\" (legs = bones 0..{sid - 1}) ==")
     return sid, sname
+
+
+def compute_bone_reorder(nodes: List[Tuple[int, str, int]]) -> Optional[Dict[int, int]]:
+    """
+    Builds an old_id -> new_id remap that makes the skeleton legs-first when
+    the source rig has legs interleaved elsewhere in the hierarchy (e.g. arm
+    chains before leg chains) rather than the "root, pelvis, legs, then
+    torso" shape detect_split_bone requires. Only called when that direct
+    check has already failed.
+
+    Legs = a pelvis child recognized as a leg bone (the leg root) plus every
+    transitive descendant. Everything that is an ANCESTOR of a leg root but
+    not itself a leg bone (root, pelvis, ...) is placed first, since IQM
+    requires a bone's parent index to be less than its own — putting legs
+    right after their shared ancestors, then everything else, keeps that
+    true without needing to touch parent/child relationships at all, only
+    the numbering. Original file order is preserved within each of the three
+    groups (SMD always lists a parent before its children, so a stable sort
+    by original order is already a valid topological order).
+
+    Returns None if no leg-root bone can be identified at all — same "can't
+    split this rig" outcome as detect_split_bone's own failure.
+    """
+    if not nodes:
+        return None
+    by_id = {bid: (name, parent) for bid, name, parent in nodes}
+    children: Dict[int, List[int]] = {}
+    for bid, _, parent in nodes:
+        children.setdefault(parent, []).append(bid)
+
+    pelvis_ids = [bid for bid, name, _ in nodes if "pelvis" in name.lower()]
+    leg_root_ids = [cid for pid in pelvis_ids for cid in children.get(pid, [])
+                    if _is_leg_bone(by_id[cid][0])]
+    if not leg_root_ids:
+        return None
+
+    legs_set: Set[int] = set()
+    stack = list(leg_root_ids)
+    while stack:
+        cur = stack.pop()
+        if cur in legs_set:
+            continue
+        legs_set.add(cur)
+        stack.extend(children.get(cur, []))
+
+    ancestor_set: Set[int] = set()
+    for lid in leg_root_ids:
+        cur = by_id[lid][1]
+        while cur != -1 and cur not in ancestor_set and cur not in legs_set:
+            ancestor_set.add(cur)
+            cur = by_id[cur][1]
+
+    order_ids = [bid for bid, _, _ in nodes]
+    ancestors_in_order = [bid for bid in order_ids if bid in ancestor_set]
+    legs_in_order = [bid for bid in order_ids if bid in legs_set]
+    rest_in_order = [bid for bid in order_ids
+                     if bid not in ancestor_set and bid not in legs_set]
+
+    new_order = ancestors_in_order + legs_in_order + rest_in_order
+    print(f"== bone reorder: {len(legs_in_order)} leg bone(s) moved ahead of "
+          f"{len(rest_in_order)} other bone(s), {len(ancestors_in_order)} shared "
+          f"ancestor(s) kept first ==")
+    return {old: new for new, old in enumerate(new_order)}
+
+
+def remap_smd_bone_ids(smd_path: Path, remap: Dict[int, int]) -> None:
+    """Rewrites an SMD in place, renumbering every bone-index reference
+    (nodes id+parent, each skeleton frame's leading bone id, each triangle
+    vertex's primary + extra-link bone ids) through `remap`. Names and
+    transforms are untouched — this only changes which index means what."""
+    node_re = re.compile(r'^\s*(-?\d+)\s+"([^"]*)"\s+(-?\d+)\s*$')
+    out: List[str] = []
+    section: Optional[str] = None
+
+    for raw in smd_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = raw.strip()
+        low = stripped.lower()
+        if low in ("nodes", "skeleton", "triangles"):
+            section = low
+            out.append(raw)
+            continue
+        if low == "end":
+            section = None
+            out.append(raw)
+            continue
+
+        if section == "nodes":
+            m = node_re.match(raw)
+            if m:
+                old_id, name, old_parent = int(m.group(1)), m.group(2), int(m.group(3))
+                new_parent = remap.get(old_parent, old_parent) if old_parent != -1 else -1
+                out.append(f'{remap.get(old_id, old_id)} "{name}" {new_parent}')
+                continue
+            out.append(raw)
+            continue
+
+        if section == "skeleton" and not low.startswith("time"):
+            parts = stripped.split()
+            if len(parts) >= 7:
+                parts[0] = str(remap.get(int(parts[0]), int(parts[0])))
+                out.append(" ".join(parts))
+                continue
+            out.append(raw)
+            continue
+
+        if section == "triangles" and not smd_is_material_line(raw):
+            parts = stripped.split()
+            if parts:
+                parts[0] = str(remap.get(int(parts[0]), int(parts[0])))
+                if len(parts) >= 10:
+                    try:
+                        nlinks = int(parts[9])
+                        for i in range(nlinks):
+                            bi = 10 + i * 2
+                            parts[bi] = str(remap.get(int(parts[bi]), int(parts[bi])))
+                    except (ValueError, IndexError):
+                        pass
+                out.append(" ".join(parts))
+                continue
+            out.append(raw)
+            continue
+
+        out.append(raw)
+
+    smd_path.write_text("\n".join(out) + "\n", encoding="utf-8", errors="ignore")
 
 
 def offset_root_bone(smd_path: Path, dx: float, dy: float, dz: float) -> None:
@@ -1377,6 +1561,21 @@ def main() -> int:
     ap.add_argument("--no-bodygroups", action="store_true",
                     help="Ignore extra bodygroup submodels (old behavior: first studio of "
                          "each group only, no skin files).")
+    ap.add_argument("--rename-anim", action="append", default=[], metavar="OLD=NEW",
+                    help="Rename a $sequence before the IQM is built (source model names a "
+                         "sequence differently than the game code asks for by name, e.g. "
+                         "'run2'/'walk2handed' where 'run'/'walk' is expected). Applies to "
+                         "the sequence's identity everywhere: the .framegroups/.bodyinfo "
+                         "entry AND the name iqm.exe embeds in the IQM itself (the built-in "
+                         "SMD is copied under the new name before iqm.exe runs, so there is "
+                         "no length constraint the way a post-hoc IQM string patch has). "
+                         "Repeatable.")
+    ap.add_argument("--dup-anim", action="append", default=[], metavar="OLD=NEW",
+                    help="Like --rename-anim but keeps OLD too: adds NEW as a second "
+                         "sequence pointing at the same anim data, for when the game code "
+                         "needs two different names to resolve to the same pose (e.g. a "
+                         "rig with only 'walk' still needs 'walk2handed' to answer for "
+                         "weapons the core code treats as two-handed). Repeatable.")
 
     # Multi-mesh support
     ap.add_argument("--split-per-submodel", action="store_true",
@@ -1441,6 +1640,16 @@ def main() -> int:
     bodygroup_mode = (not args.no_bodygroups and not args.split_per_submodel
                       and (info.total_body_combos > 1 or info.numskinfamilies > 1))
 
+    # Skin files exist so QC can hide/show a bodygroup submodel at runtime
+    # (Body_SetGroup). Most bodygroups a converted character carries (head
+    # variants, gear) are never toggled in QC, so writing every body x family
+    # combo for them is pure noise. Only weapon attachment slots are actually
+    # driven at runtime today, so gate skin-file writing on those specifically
+    # rather than on "has any bodygroup at all". The mesh itself still bakes
+    # every submodel either way (bodygroup_mode) -- this only skips the sidecars.
+    _SKIN_GROUP_NAMES = ("wpn_upgrade", "wpn_silencer", "wpn_scope")
+    write_skins = bodygroup_mode and any(g.name.lower() in _SKIN_GROUP_NAMES for g in groups)
+
     if args.no_bodygroups or args.split_per_submodel:
         # old behavior: first (non-blank) studio per group
         for g in groups:
@@ -1465,23 +1674,85 @@ def main() -> int:
     mesh_paths = list(mesh_paths_by_stem.values())
 
     # Legs/torso boundary for the QC upper/lower body split (emitted into
-    # .bodyinfo; also gates --split-body)
+    # .bodyinfo; also gates --split-body). If the rig isn't legs-first (legs
+    # interleaved elsewhere, e.g. after the arms), renumber every bone in
+    # every extracted SMD once so it becomes legs-first, then retry — this
+    # only fires as a fallback and never touches an already-working rig.
     splitbone = detect_split_bone(parse_smd_nodes(mesh_paths[0])) if mesh_paths else None
+    if splitbone is None and mesh_paths:
+        reorder = compute_bone_reorder(parse_smd_nodes(mesh_paths[0]))
+        if reorder:
+            for smd_path in sorted(workdir.rglob("*.smd")):
+                remap_smd_bone_ids(smd_path, reorder)
+            splitbone = detect_split_bone(parse_smd_nodes(mesh_paths[0]))
 
     # Resolve anim SMDs; flatten multi-blend sequences to a single anim baked
     # at blend value 0deg (HLMV behavior) unless disabled.
+    rename_anim: Dict[str, str] = {}
+    for pair in args.rename_anim:
+        old, new = pair.split("=", 1)
+        rename_anim[old] = new
+    dup_anim: Dict[str, List[str]] = {}
+    for pair in args.dup_anim:
+        old, new = pair.split("=", 1)
+        dup_anim.setdefault(old, []).append(new)
+
     anim_paths: List[Path] = []
+    dup_sequences: List[QcSequence] = []
     flattened = 0
+    renamed = 0
+    duped = 0
     for seq in sequences:
         stems = seq.blend_smds or [seq.smd_base]
         paths = [resolve_file_recursive(workdir, stem + ".smd") for stem in stems]
         if len(paths) > 1 and not args.no_blend_flatten:
-            anim_paths.append(flatten_blend_sequence(seq, paths, workdir))
+            apath = flatten_blend_sequence(seq, paths, workdir)
             flattened += 1
         else:
-            anim_paths.append(paths[0])
+            apath = paths[0]
+
+        # Both --dup-anim and --rename-anim read seq.qc_name BEFORE any
+        # rename below overwrites it, so a dup keyed on the original name and
+        # a rename of that same original both see the identity they expect.
+        for dup_name in dup_anim.get(seq.qc_name, []):
+            dup_path = workdir / f"{sanitize_token(dup_name)}.smd"
+            shutil.copy2(apath, dup_path)
+            print(f"   [dup] {seq.qc_name} -> {dup_name}")
+            # has_motion and motion_src carry over or the copy is invisible to
+            # root-motion extraction below, and a duplicated walk or run keeps
+            # the forward drift the original had stripped: the legs then slide
+            # out from under a torso holding a static aim pose.
+            dup_sequences.append(QcSequence(qc_name=dup_name, smd_base=seq.smd_base,
+                                            fps=seq.fps, loop=seq.loop,
+                                            has_motion=seq.has_motion,
+                                            motion_src=seq.motion_src or seq.qc_name))
+            duped += 1
+
+        # iqm.exe embeds whatever path it was given as the anim's name, so a
+        # rename has to swap in a freshly-named copy here (not just relabel
+        # seq.qc_name below) or the IQM's own anim table would still read the
+        # old name even though the .framegroups sidecar says otherwise.
+        new_name = rename_anim.get(seq.qc_name)
+        if new_name:
+            renamed_path = workdir / f"{sanitize_token(new_name)}.smd"
+            shutil.copy2(apath, renamed_path)
+            print(f"   [rename] {seq.qc_name} -> {new_name}")
+            apath = renamed_path
+            seq.motion_src = seq.motion_src or seq.qc_name
+            seq.qc_name = new_name
+            renamed += 1
+
+        anim_paths.append(apath)
+
+    if dup_sequences:
+        sequences.extend(dup_sequences)
+        anim_paths.extend(workdir / f"{sanitize_token(s.qc_name)}.smd" for s in dup_sequences)
     if flattened:
         print(f"== Flattened {flattened} blended sequence(s) at blend value 0 ==")
+    if renamed:
+        print(f"== Renamed {renamed} sequence(s) (--rename-anim) ==")
+    if duped:
+        print(f"== Duplicated {duped} sequence(s) (--dup-anim) ==")
 
     print(f"== Meshes: {len(mesh_paths)} (bodygroup mode: {'ON' if bodygroup_mode else 'off'})")
     for p in mesh_paths:
@@ -1536,7 +1807,7 @@ def main() -> int:
         jump_strip = {"jump", "long_jump"} if args.feet_z is not None else set()
         axes_by_path: Dict[Path, Set[int]] = {}
         for seq, apath in zip(sequences, anim_paths):
-            s = info.sequence_by_label(seq.qc_name)
+            s = info.sequence_by_label(seq.motion_src or seq.qc_name)
             if seq.has_motion or (s and s.motion_axes):
                 axes = set(s.motion_axes) if (s and s.motion_axes) else {0, 1, 2}
                 axes_by_path.setdefault(apath, set()).update(axes)
@@ -1715,8 +1986,12 @@ def main() -> int:
         # 8b) Bodygroup skin files + bodyinfo sidecar
         bases = compute_group_bases(groups, info)
         if bodygroup_mode:
-            write_skin_files(out_path, groups, bases, submodels, info,
-                             modelname, args.material_prefix)
+            if write_skins:
+                write_skin_files(out_path, groups, bases, submodels, info,
+                                 modelname, args.material_prefix)
+            else:
+                print("== Skipping skin files: no wpn_upgrade/wpn_silencer/wpn_scope "
+                      "bodygroup, nothing toggles them at runtime ==")
             write_bodyinfo(out_path, groups, bases, info, sequences, splitbone)
         elif splitbone is not None:
             # minimal sidecar: QC needs the splitbone even without bodygroups
@@ -1741,6 +2016,56 @@ def main() -> int:
                     (out_path.with_name(f"{out_path.stem}_torso{out_path.suffix}"),
                      torso_smd, torso_meshes),
                 )
+
+                # Both halves are two views of ONE skeleton, shown as two
+                # entities, so they have to be built from byte identical
+                # animations or they drift apart on screen. The legs half is
+                # also the one the player entity wears and so the one that has
+                # to stand on the floor, and it does not necessarily inherit
+                # the whole model's --feet-z result (skinning cancels the bind
+                # skeleton, not the bind vertices, and each half carries its
+                # own subset of those). So: measure the legs, and if it is off,
+                # shift BOTH halves by that one delta. Correct feet, alignment
+                # preserved.
+                half_anims = anim_paths
+                if args.feet_z is not None and idle_frame is not None:
+                    probe = out_path.with_name(f"{out_path.stem}__probe{out_path.suffix}")
+                    build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=probe,
+                              mesh_paths=[legs_smd], anim_paths=anim_paths,
+                              workdir=workdir, modelname=modelname)
+                    measured = measure_animated_feet_z(probe, idle_frame)
+                    probe.unlink()
+                    if abs(measured - args.feet_z) > 0.5:
+                        dzh = args.feet_z - measured
+                        print(f"== body halves: legs feet {measured:.2f}, shifting "
+                              f"both halves {dzh:+.2f} ==")
+                        half_anims = []
+                        for i, ap in enumerate(anim_paths):
+                            cp = workdir / f"__half{i:04d}_{ap.name}"
+                            shutil.copy2(ap, cp)
+                            offset_root_bone(cp, 0.0, 0.0, dzh)
+                            half_anims.append(cp)
+
+                        # The crouch plant above calibrated the whole model, so
+                        # it does not carry to the halves either. Same fix, same
+                        # family, measured on the halves' own legs: shifted in
+                        # both halves at once, so crouching stays aligned too.
+                        if crouch_start is not None:
+                            build_iqm(iqm_exe=iqm_exe, rotate=args.rotate,
+                                      out_path=probe, mesh_paths=[legs_smd],
+                                      anim_paths=half_anims, workdir=workdir,
+                                      modelname=modelname)
+                            hcz = measure_animated_feet_z(probe, crouch_start)
+                            probe.unlink()
+                            hcd = args.feet_z - hcz
+                            if abs(hcd) > 0.5:
+                                fam = {cp for seq, cp in zip(sequences, half_anims)
+                                       if seq.qc_name == "crawl"
+                                       or seq.qc_name.startswith("crouch_")}
+                                print(f"== body halves: crouch feet {hcz:.2f}, shifting "
+                                      f"{len(fam)} crouch-family anim(s) {hcd:+.2f} ==")
+                                for cp in fam:
+                                    offset_root_bone(cp, 0.0, 0.0, hcd)
                 for half_path, half_smd, half_meshes in halves:
                     if framegroup_entries:
                         write_framegroups(
@@ -1754,11 +2079,11 @@ def main() -> int:
                         rotate=args.rotate,
                         out_path=half_path,
                         mesh_paths=[half_smd],
-                        anim_paths=anim_paths,
+                        anim_paths=half_anims,
                         workdir=workdir,
                         modelname=modelname,
                     )
-                    if bodygroup_mode:
+                    if bodygroup_mode and write_skins:
                         write_skin_files(half_path, groups, bases, submodels, info,
                                          modelname, args.material_prefix,
                                          mesh_filter=half_meshes)
