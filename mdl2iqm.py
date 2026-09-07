@@ -428,6 +428,97 @@ def remap_smd_bone_ids(smd_path: Path, remap: Dict[int, int]) -> None:
     smd_path.write_text("\n".join(out) + "\n", encoding="utf-8", errors="ignore")
 
 
+def parse_smd_skeleton(smd_path: Path) -> Tuple[List[Tuple[int, str, int]], List[Dict[int, List[float]]]]:
+    """Reads an SMD's nodes and every skeleton frame. Frames map bone id ->
+    [x, y, z, rx, ry, rz], the bone's transform in its PARENT's space."""
+    nodes: List[Tuple[int, str, int]] = []
+    frames: List[Dict[int, List[float]]] = []
+    node_re = re.compile(r'^\s*(-?\d+)\s+"([^"]*)"\s+(-?\d+)\s*$')
+    section = None
+    for raw in smd_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        low = raw.strip().lower()
+        if low in ("nodes", "skeleton", "triangles"):
+            section = low
+            continue
+        if low == "end":
+            section = None
+            continue
+        if section == "nodes":
+            m = node_re.match(raw)
+            if m:
+                nodes.append((int(m.group(1)), m.group(2), int(m.group(3))))
+        elif section == "skeleton":
+            if low.startswith("time"):
+                frames.append({})
+            elif frames:
+                parts = raw.split()
+                if len(parts) >= 7:
+                    frames[-1][int(parts[0])] = [float(v) for v in parts[1:7]]
+    return nodes, frames
+
+
+def retarget_smd(src_smd: Path, ref_smd: Path, out_smd: Path) -> int:
+    """
+    Rewrites a loose animation SMD onto another SMD's skeleton, matching bones
+    by NAME rather than by index.
+
+    Animations exported at different times from the same character routinely
+    carry a different bone ORDER and a different leaf set (missing finger tips,
+    no face bones, an extra Toe0) while the hierarchy itself is identical.
+    Feeding one straight to iqm.exe alongside a mesh built on the other rig
+    silently animates the wrong joints.
+
+    Rotations come from the source, positions from the reference: an SMD frame
+    stores each bone in its parent's space, so its position IS the bone length,
+    and taking the source's would restretch the model to the proportions of
+    whatever rig the animation happened to be exported on. The root is the
+    exception, since there the position is the motion, so it keeps the
+    reference's rest location plus the source's per-frame delta. A bone the
+    source does not have holds its reference rest pose.
+    """
+    ref_nodes, ref_frames = parse_smd_skeleton(ref_smd)
+    src_nodes, src_frames = parse_smd_skeleton(src_smd)
+    if not ref_frames or not src_frames:
+        raise RuntimeError(f"retarget: no skeleton frames in {src_smd.name} or {ref_smd.name}")
+
+    rest = ref_frames[0]
+    src_by_name = {name: bid for bid, name, _ in src_nodes}
+    root_id = next((bid for bid, _, parent in ref_nodes if parent < 0), ref_nodes[0][0])
+    src_root = src_by_name.get(dict((b, n) for b, n, _ in ref_nodes)[root_id])
+    src_root0 = src_frames[0].get(src_root) if src_root is not None else None
+
+    out = ["version 1", "nodes"]
+    for bid, name, parent in ref_nodes:
+        out.append(f'{bid} "{name}" {parent}')
+    out.append("end")
+    out.append("skeleton")
+
+    matched = 0
+    for t, frame in enumerate(src_frames):
+        out.append(f"  time {t}")
+        for bid, name, parent in ref_nodes:
+            base = rest.get(bid, [0.0] * 6)
+            sid = src_by_name.get(name)
+            sv = frame.get(sid) if sid is not None else None
+            if sv is None:
+                v = base
+            elif bid == root_id and src_root0 is not None:
+                v = [base[0] + sv[0] - src_root0[0],
+                     base[1] + sv[1] - src_root0[1],
+                     base[2] + sv[2] - src_root0[2],
+                     sv[3], sv[4], sv[5]]
+            else:
+                v = [base[0], base[1], base[2], sv[3], sv[4], sv[5]]
+            out.append("  %d %.6f %.6f %.6f %.6f %.6f %.6f" % (bid, v[0], v[1], v[2], v[3], v[4], v[5]))
+        if t == 0:
+            matched = sum(1 for _, name, _ in ref_nodes if name in src_by_name)
+    out.append("end")
+    out_smd.write_text("\n".join(out) + "\n", encoding="utf-8")
+    print(f"   [extra] {src_smd.name} -> {out_smd.stem}: {len(src_frames)} frames, "
+          f"{matched}/{len(ref_nodes)} bones matched by name")
+    return len(src_frames)
+
+
 def offset_root_bone(smd_path: Path, dx: float, dy: float, dz: float) -> None:
     """
     Modifies SMD in-place: bone 0 (root) X/Y/Z are shifted by (dx, dy, dz)
@@ -1399,6 +1490,23 @@ def merge_mesh_smds(mesh_paths: List[Path], out_path: Path, strict: bool = True)
     Assumption (usually true for HL viewmodels/weapons): nodes+skeleton are identical.
     If strict=True and headers differ (excluding whitespace), it raises.
     """
+    # mdldec writes an SMD with no triangles section for a submodel that carries
+    # no geometry (a bodygroup's "blank" slot). It contributes nothing to the
+    # merge and would otherwise abort it.
+    def has_triangles(p: Path) -> bool:
+        for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if raw.strip().lower() == "triangles":
+                return True
+        return False
+
+    kept = [p for p in mesh_paths if has_triangles(p)]
+    for p in mesh_paths:
+        if p not in kept:
+            print(f"!! Skipping geometry-less mesh SMD: {p.name}")
+    if not kept:
+        raise RuntimeError("No mesh SMD carries any geometry")
+    mesh_paths = kept
+
     if len(mesh_paths) < 2:
         shutil.copy2(mesh_paths[0], out_path)
         return
@@ -1582,6 +1690,16 @@ def main() -> int:
                          "needs two different names to resolve to the same pose (e.g. a "
                          "rig with only 'walk' still needs 'walk2handed' to answer for "
                          "weapons the core code treats as two-handed). Repeatable.")
+    ap.add_argument("--extra-anim", action="append", default=[], metavar="NAME=FILE.smd[#fps[#loop]]",
+                    help="Add an animation the MDL does not contain, from a loose SMD "
+                         "(fps defaults to 30, loop to 0). The SMD is retargeted onto the "
+                         "model's own skeleton by bone NAME first, so an export carrying a "
+                         "different bone order or a different leaf set still lands on the "
+                         "right joints. Root X/Y is locked afterwards, since a monster is "
+                         "moved by walkmove and not by its animation; pass "
+                         "--extra-anim-keep-motion to leave it in. Repeatable.")
+    ap.add_argument("--extra-anim-keep-motion", action="store_true",
+                    help="Do not lock root X/Y on --extra-anim sequences.")
 
     # Multi-mesh support
     ap.add_argument("--split-per-submodel", action="store_true",
@@ -1685,7 +1803,14 @@ def main() -> int:
     mesh_paths_by_stem: Dict[str, Path] = {}
     for sm in submodels:
         if sm.stem and sm.stem.lower() not in mesh_paths_by_stem:
-            mesh_paths_by_stem[sm.stem.lower()] = resolve_file_recursive(workdir, sm.stem + ".smd")
+            try:
+                mesh_paths_by_stem[sm.stem.lower()] = resolve_file_recursive(
+                    workdir, sm.stem + ".smd")
+            except FileNotFoundError:
+                # An empty bodygroup slot: the QC names a submodel mdldec wrote
+                # no SMD for. It contributes no meshes, which is what selecting
+                # that slot is supposed to mean.
+                print(f"!! Bodygroup submodel '{sm.stem}' has no SMD; treating as empty")
     mesh_paths = list(mesh_paths_by_stem.values())
 
     # Legs/torso boundary for the QC upper/lower body split (emitted into
@@ -1762,6 +1887,30 @@ def main() -> int:
     if dup_sequences:
         sequences.extend(dup_sequences)
         anim_paths.extend(workdir / f"{sanitize_token(s.qc_name)}.smd" for s in dup_sequences)
+
+    # Added last so they land at the end of the framegroup table: an index the
+    # game code already hardcodes must not shift because an extra was added.
+    if args.extra_anim and not mesh_paths:
+        raise RuntimeError("--extra-anim needs a mesh SMD to retarget against")
+    for spec in args.extra_anim:
+        if "=" not in spec:
+            raise RuntimeError(f"--extra-anim wants NAME=FILE.smd, got: {spec}")
+        name, rest = spec.split("=", 1)
+        bits = rest.split("#")
+        src = Path(bits[0]).expanduser()
+        fps = int(bits[1]) if len(bits) > 1 and bits[1] else 30
+        loop = int(bits[2]) if len(bits) > 2 and bits[2] else 0
+        if not src.is_file():
+            raise RuntimeError(f"--extra-anim source not found: {src}")
+        dst = workdir / f"{sanitize_token(name)}.smd"
+        retarget_smd(src, mesh_paths[0], dst)
+        if not args.extra_anim_keep_motion:
+            strip_root_xy(dst)
+        sequences.append(QcSequence(qc_name=name, smd_base=sanitize_token(name),
+                                    fps=fps, loop=loop))
+        anim_paths.append(dst)
+    if args.extra_anim:
+        print(f"== Added {len(args.extra_anim)} extra sequence(s) (--extra-anim) ==")
     if flattened:
         print(f"== Flattened {flattened} blended sequence(s) at blend value 0 ==")
     if renamed:
@@ -1785,7 +1934,10 @@ def main() -> int:
     for sm in submodels:
         if not sm.stem:
             continue
-        mp = mesh_paths_by_stem[sm.stem.lower()]
+        mp = mesh_paths_by_stem.get(sm.stem.lower())
+        if mp is None:
+            sm.meshes = []
+            continue
         # b<group>s<submodel> tag: unique, compact, engine-safe
         tag = f"b{sm.group_index}s{sm.submodel_index}" if bodygroup_mode else ""
         replaced, stems, mesh_list = rewrite_smd_materials(
