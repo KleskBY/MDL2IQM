@@ -1721,7 +1721,33 @@ def merge_mesh_smds(mesh_paths: List[Path], out_path: Path, strict: bool = True)
                 )
         merged_tri.extend(t)
 
-    out_path.write_text("".join(h0) + "".join(merged_tri) + "end\n", encoding="utf-8", errors="ignore")
+    # Group the blocks by material, first appearance keeping its position.
+    #
+    # iqm.exe appends triangles to the mesh it is CURRENTLY building, and a
+    # material that comes back after a different one has intervened is dropped
+    # without a warning. Two mesh SMDs sharing a texture therefore lose the
+    # second one's geometry: the player body and legs are both bodystalker and
+    # merge in the order body, face, legs, so the legs went every time.
+    order: List[str] = []
+    by_mat: Dict[str, List[str]] = {}
+    i = 0
+    while i < len(merged_tri):
+        mat = merged_tri[i]
+        if not smd_is_material_line(mat):
+            i += 1
+            continue
+        key = mat.strip()
+        if key not in by_mat:
+            by_mat[key] = []
+            order.append(key)
+        by_mat[key].extend(merged_tri[i:i + 4])
+        i += 4
+
+    grouped: List[str] = []
+    for key in order:
+        grouped.extend(by_mat[key])
+
+    out_path.write_text("".join(h0) + "".join(grouped) + "end\n", encoding="utf-8", errors="ignore")
 
 
 # ----------------------------
