@@ -1388,6 +1388,137 @@ def smd_vertex_primary_bone(vert_line: str) -> int:
     return max(pairs, key=lambda p: p[1])[0]
 
 
+def _smd_tri_blocks(path: Path) -> Tuple[List[str], List[Tuple[str, List[str]]]]:
+    """Splits an SMD into (header lines, [(material line, [3 vertex lines])])."""
+    header, tri = split_smd_sections(path)
+    blocks: List[Tuple[str, List[str]]] = []
+    i = 0
+    while i + 3 < len(tri) + 1 and i < len(tri):
+        mat = tri[i]
+        if not smd_is_material_line(mat):
+            i += 1
+            continue
+        blocks.append((mat, tri[i + 1:i + 4]))
+        i += 4
+    return header, blocks
+
+
+def _vkey(vert_line: str) -> Tuple[int, int, int]:
+    t = vert_line.split()
+    return (round(float(t[1]) * 1000), round(float(t[2]) * 1000), round(float(t[3]) * 1000))
+
+
+def _boundary_edges(blocks) -> Dict[Tuple, int]:
+    counts: Dict[Tuple, int] = {}
+    for _mat, verts in blocks:
+        k = [_vkey(v) for v in verts]
+        for a, b in ((k[0], k[1]), (k[1], k[2]), (k[2], k[0])):
+            e = (a, b) if a <= b else (b, a)
+            counts[e] = counts.get(e, 0) + 1
+    return counts
+
+
+def seal_smd_half(half_path: Path, whole_path: Path) -> int:
+    """
+    Closes the opening a body-half split leaves behind.
+
+    Splitting a mesh at the waist leaves both halves open: the legs end in a
+    hollow tube and the torso does too. The two halves are separate entities
+    playing different animations (gait below, aim pose above), so the moment
+    their poses disagree by a degree the seam parts and the view goes straight
+    into the body. Overlapping the boundary triangles into both halves narrows
+    that but cannot close it.
+
+    Only the edges the CUT created are capped, never the ones the artist left
+    open. An edge on the boundary of the whole mesh (eye sockets, cuffs, the
+    inside of a collar) is on the boundary of the half too, so the seam is
+    exactly the set difference. Each resulting loop is fanned to its own
+    averaged centre, which keeps two separate openings from being stitched to
+    one another.
+
+    Both windings are emitted per edge. The cap sits inside the other half
+    where nothing should ever see it, and guessing the winding wrong would
+    leave the hole exactly as it was.
+
+    Returns the number of triangles added.
+    """
+    header, blocks = _smd_tri_blocks(half_path)
+    if not blocks:
+        return 0
+    _wh, whole_blocks = _smd_tri_blocks(whole_path)
+
+    open_whole = {e for e, n in _boundary_edges(whole_blocks).items() if n == 1}
+    open_half = {e for e, n in _boundary_edges(blocks).items() if n == 1}
+    cut = open_half - open_whole
+    if not cut:
+        return 0
+
+    # A vertex line per position, and the material the seam triangle used, so
+    # the cap inherits real UVs, normals and bone weights rather than invented
+    # ones.
+    vline: Dict[Tuple, str] = {}
+    vmat: Dict[Tuple, str] = {}
+    for mat, verts in blocks:
+        for v in verts:
+            k = _vkey(v)
+            vline.setdefault(k, v)
+            vmat.setdefault(k, mat)
+
+    adj: Dict[Tuple, List[Tuple]] = {}
+    for a, b in cut:
+        adj.setdefault(a, []).append(b)
+        adj.setdefault(b, []).append(a)
+
+    seen: Set[Tuple] = set()
+    added = 0
+    out_lines: List[str] = []
+    for start in list(adj):
+        if start in seen:
+            continue
+        comp = []
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            comp.append(cur)
+            stack.extend(adj.get(cur, []))
+        comp_set = set(comp)
+        loop_edges = [e for e in cut if e[0] in comp_set]
+        if len(loop_edges) < 3:
+            continue
+
+        toks = [vline[k].split() for k in comp]
+        n = float(len(toks))
+        # 1..8 is pos3 + normal3 + uv2; token 0 is the bone.
+        centre = [sum(float(t[i]) for t in toks) / n for i in range(1, 9)]
+        bone = max(set(t[0] for t in toks), key=[t[0] for t in toks].count)
+        cline = ("%s %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n"
+                 % (bone, centre[0], centre[1], centre[2],
+                    centre[3], centre[4], centre[5], centre[6], centre[7]))
+        mat = max(set(vmat[k] for k in comp), key=[vmat[k] for k in comp].count)
+
+        for a, b in loop_edges:
+            for va, vb in ((a, b), (b, a)):
+                out_lines.append(mat)
+                out_lines.append(vline[va])
+                out_lines.append(vline[vb])
+                out_lines.append(cline)
+                added += 1
+
+    if not added:
+        return 0
+
+    body = []
+    for mat, verts in blocks:
+        body.append(mat)
+        body.extend(verts)
+    half_path.write_text("".join(header) + "".join(body) + "".join(out_lines) + "end\n",
+                         encoding="utf-8", errors="ignore")
+    return added
+
+
 def split_mesh_smd(merged_mesh: Path, splitbone: int,
                    legs_out: Path, torso_out: Path) -> Tuple[Set[str], Set[str]]:
     """Partitions a (material-rewritten) mesh SMD at `splitbone` (0-based;
@@ -1700,6 +1831,11 @@ def main() -> int:
                          "--extra-anim-keep-motion to leave it in. Repeatable.")
     ap.add_argument("--extra-anim-keep-motion", action="store_true",
                     help="Do not lock root X/Y on --extra-anim sequences.")
+    ap.add_argument("--no-seal-halves", action="store_true",
+                    help="Leave the opening a --split-body cut makes uncapped. The cap "
+                         "is what stops the view going into the body when the two halves' "
+                         "poses disagree; it only ever closes edges the cut itself "
+                         "created, never ones the model already had open.")
     ap.add_argument("--no-half-plant", action="store_true",
                     help="Build --split-body halves straight from the whole model's "
                          "animations, skipping the measure-and-shift pass that lands "
@@ -2184,6 +2320,12 @@ def main() -> int:
                 torso_smd = workdir / f"{modelname}__torso_mesh.smd"
                 legs_meshes, torso_meshes = split_mesh_smd(
                     split_src, splitbone[0], legs_smd, torso_smd)
+
+                if not args.no_seal_halves:
+                    nl = seal_smd_half(legs_smd, split_src)
+                    nt = seal_smd_half(torso_smd, split_src)
+                    print(f"== split-body: sealed the cut with {nl} legs / {nt} "
+                          f"torso triangle(s) ==")
 
                 halves = (
                     (out_path.with_name(f"{out_path.stem}_legs{out_path.suffix}"),
