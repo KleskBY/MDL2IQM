@@ -2478,6 +2478,36 @@ def main() -> int:
                                       f"{len(fam)} crouch-family anim(s) {hcd:+.2f} ==")
                                 for cp in fam:
                                     offset_root_bone(cp, 0.0, 0.0, hcd)
+
+                        # And the death plant does not carry either. The blanket
+                        # shift above lands the halves' STANDING pose, so it
+                        # takes the deaths with it and leaves the corpse hanging
+                        # by that same amount. Re-planted here on the halves'
+                        # own legs, per animation and on its last frame, exactly
+                        # as the whole model's deaths were.
+                        if death_strip:
+                            build_iqm(iqm_exe=iqm_exe, rotate=args.rotate,
+                                      out_path=probe, mesh_paths=[legs_smd],
+                                      anim_paths=half_anims, workdir=workdir,
+                                      modelname=modelname)
+                            hd = 0
+                            for seq, cp in zip(sequences, half_anims):
+                                if seq.qc_name not in death_strip:
+                                    continue
+                                ent = next((e for e in framegroup_entries
+                                            if e[4] == seq.qc_name), None)
+                                if ent is None or ent[1] < 2:
+                                    continue
+                                dz = args.feet_z - measure_animated_feet_z(
+                                    probe, ent[0] + ent[1] - 1)
+                                if abs(dz) <= 1.0:
+                                    continue
+                                ramp_root_z(cp, dz)
+                                hd += 1
+                            probe.unlink()
+                            if hd:
+                                print(f"== body halves: {hd} death anim(s) did not "
+                                      f"rest on {args.feet_z:g}, ramped ==")
                 for half_path, half_smd, half_meshes in halves:
                     if framegroup_entries:
                         write_framegroups(
