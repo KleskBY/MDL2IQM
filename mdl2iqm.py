@@ -564,6 +564,64 @@ def offset_root_bone(smd_path: Path, dx: float, dy: float, dz: float) -> None:
     print(f"   [offset] root bone shifted by ({dx},{dy},{dz}) in: {smd_path.name}")
 
 
+def ramp_root_z(smd_path: Path, delta: float) -> None:
+    """
+    Adds a linear ramp of `delta` to the root bone's Z, none of it on the first
+    frame and all of it on the last.
+
+    A uniform offset is wrong for an animation whose START is already correct
+    and whose END is not: raising the whole thing to land the corpse right
+    would begin the fall with the character in the air. Zeroing the drift
+    outright is wrong the other way, since a body collapsing to the floor is
+    SUPPOSED to bring its root down with it. Correcting only the far end leaves
+    the standing pose untouched and lands the resting pose where it belongs.
+    """
+    bone_re = re.compile(r'^(\s*0\s+)(-?[\d.eE+]+)(\s+)(-?[\d.eE+]+)(\s+)(-?[\d.eE+]+)(\s+.*)$')
+    time_re = re.compile(r'^\s*time\s+(-?\d+)\s*$', re.IGNORECASE)
+    lines = smd_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+    nframes = 0
+    in_sk = False
+    for raw in lines:
+        st = raw.strip().lower()
+        if st == "skeleton":
+            in_sk = True
+            continue
+        if st == "end":
+            in_sk = False
+            continue
+        if in_sk and time_re.match(raw):
+            nframes += 1
+    if nframes < 2:
+        return
+
+    out = []
+    in_sk = False
+    idx = -1
+    for raw in lines:
+        st = raw.strip().lower()
+        if st == "skeleton":
+            in_sk = True
+            out.append(raw)
+            continue
+        if st == "end":
+            in_sk = False
+            out.append(raw)
+            continue
+        if in_sk and time_re.match(raw):
+            idx += 1
+            out.append(raw)
+            continue
+        if in_sk and idx >= 0:
+            m = bone_re.match(raw)
+            if m:
+                z = float(m.group(6)) + delta * (idx / (nframes - 1.0))
+                out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{m.group(5)}{z:.6f}{m.group(7)}\n")
+                continue
+        out.append(raw)
+    smd_path.write_text("".join(out), encoding="utf-8", errors="ignore")
+
+
 def strip_root_xy(smd_path: Path) -> None:
     """
     LEGACY (--inplace): root bone (bone 0) X and Y locked to frame-0 values
@@ -2117,6 +2175,17 @@ def main() -> int:
         # fall back to matching the MDL binary label. Axes are measured, so
         # the union set only gates.
         jump_strip = {"jump", "long_jump"} if args.feet_z is not None else set()
+
+        # A death animation ends with the body on the floor. Whether it ends at
+        # the RIGHT height is a property of how it was authored, and one of
+        # these model families is out by about a hip height, so the corpse
+        # renders sunk through the ground. Collected here and corrected below,
+        # where there is a built model to measure against.
+        death_strip = set()
+        if args.feet_z is not None:
+            death_strip = {seq.qc_name for seq in sequences
+                           if seq.qc_name.startswith("die")
+                           or seq.qc_name in ("headshot", "gutshot")}
         axes_by_path: Dict[Path, Set[int]] = {}
         for seq, apath in zip(sequences, anim_paths):
             s = info.sequence_by_label(seq.motion_src or seq.qc_name)
@@ -2133,7 +2202,7 @@ def main() -> int:
         for seq, apath in zip(sequences, anim_paths):
             if seq.qc_name in jump_strip:
                 strip_root_xy(apath)
-        if not axes_by_path and not jump_strip:
+        if not axes_by_path and not jump_strip and not death_strip:
             print("   (no motion-flagged sequences)")
 
     # 5c) Root-bone offset — shifts the entire skeleton (and weighted mesh)
@@ -2294,6 +2363,30 @@ def main() -> int:
                               workdir=workdir, modelname=modelname)
                     rz = measure_animated_feet_z(out_path, crouch_start)
                     print(f"== crouch feet: {cz:.2f} -> {rz:.2f} (target {args.feet_z:g}) ==")
+
+            # Death plant. Measured per animation on its LAST frame, the pose
+            # the corpse actually holds, and applied as a ramp so the standing
+            # frame it starts from does not move. Animations already resting at
+            # the right height measure a delta of nothing and are left alone.
+            fixed = 0
+            for seq, apath in zip(sequences, anim_paths):
+                if seq.qc_name not in death_strip:
+                    continue
+                ent = next((e for e in framegroup_entries if e[4] == seq.qc_name), None)
+                if ent is None or ent[1] < 2:
+                    continue
+                last = ent[0] + ent[1] - 1
+                dz = args.feet_z - measure_animated_feet_z(out_path, last)
+                if abs(dz) <= 1.0:
+                    continue
+                ramp_root_z(apath, dz)
+                fixed += 1
+            if fixed:
+                print(f"== death plant: {fixed} death anim(s) did not rest on "
+                      f"{args.feet_z:g}, ramped ==")
+                build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=out_path,
+                          mesh_paths=mesh_paths, anim_paths=anim_paths,
+                          workdir=workdir, modelname=modelname)
 
         # 8b) Bodygroup skin files + bodyinfo sidecar
         bases = compute_group_bases(groups, info)
