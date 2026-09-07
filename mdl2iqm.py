@@ -850,9 +850,9 @@ def rewrite_smd_materials(
     even when submodels share textures. Kept short and free of parens/paths
     because engines cap surface names (64-char qpath) and .skin parsing
     chokes on exotic characters — the generated .skin files then map each
-    token to its real texture path (or common/nodraw). Without a skin file
-    applied these meshes have no resolvable texture, but bodygroup models
-    always ship skin files.
+    token to its real texture path (or common/nodraw). A tagged surface has no
+    resolvable texture without its skin file, so the caller tags only when it
+    is going to write one.
 
     Returns:
       (replacements_count, texture_stems_used, mesh_list)
@@ -1700,6 +1700,12 @@ def main() -> int:
                          "--extra-anim-keep-motion to leave it in. Repeatable.")
     ap.add_argument("--extra-anim-keep-motion", action="store_true",
                     help="Do not lock root X/Y on --extra-anim sequences.")
+    ap.add_argument("--no-half-plant", action="store_true",
+                    help="Build --split-body halves straight from the whole model's "
+                         "animations, skipping the measure-and-shift pass that lands "
+                         "the legs half on --feet-z. Use it to rule that pass out when "
+                         "a split body looks wrong; the halves then sit wherever the "
+                         "whole model does.")
 
     # Multi-mesh support
     ap.add_argument("--split-per-submodel", action="store_true",
@@ -1938,8 +1944,11 @@ def main() -> int:
         if mp is None:
             sm.meshes = []
             continue
-        # b<group>s<submodel> tag: unique, compact, engine-safe
-        tag = f"b{sm.group_index}s{sm.submodel_index}" if bodygroup_mode else ""
+        # b<group>s<submodel> tag: unique, compact, engine-safe. Gated on
+        # write_skins and NOT on bodygroup_mode, because the tag is only
+        # resolvable through a skin file: tagged surfaces with no skin file
+        # beside them are an untextured model.
+        tag = f"b{sm.group_index}s{sm.submodel_index}" if write_skins else ""
         replaced, stems, mesh_list = rewrite_smd_materials(
             mp, modelname, prefix=args.material_prefix, mesh_tag=tag)
         sm.meshes = mesh_list
@@ -2194,7 +2203,9 @@ def main() -> int:
                 # shift BOTH halves by that one delta. Correct feet, alignment
                 # preserved.
                 half_anims = anim_paths
-                if args.feet_z is not None and idle_frame is not None:
+                if args.no_half_plant:
+                    print("== body halves: planting disabled (--no-half-plant) ==")
+                if args.feet_z is not None and idle_frame is not None and not args.no_half_plant:
                     probe = out_path.with_name(f"{out_path.stem}__probe{out_path.suffix}")
                     build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=probe,
                               mesh_paths=[legs_smd], anim_paths=anim_paths,
