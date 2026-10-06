@@ -3,3 +3,5 @@
 /iqm-master
 /__pycache__
 /.*
+/hl_retarget_work
+*.iqm

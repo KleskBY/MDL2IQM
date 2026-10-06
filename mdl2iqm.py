@@ -564,6 +564,46 @@ def offset_root_bone(smd_path: Path, dx: float, dy: float, dz: float) -> None:
     print(f"   [offset] root bone shifted by ({dx},{dy},{dz}) in: {smd_path.name}")
 
 
+def offset_root_z_frames(smd_path: Path, deltas: List[float]) -> None:
+    """
+    Adds a DIFFERENT Z to the root bone on each frame, `deltas` in frame order.
+
+    A constant moves a whole animation and a ramp tilts it end to end; neither
+    can reach a single dip in the middle. Anything shorter than the animation is
+    padded with zero, so a caller only has to describe the frames it cares about.
+    """
+    bone_re = re.compile(r'^(\s*0\s+)(-?[\d.eE+]+)(\s+)(-?[\d.eE+]+)(\s+)(-?[\d.eE+]+)(\s+.*)$')
+    time_re = re.compile(r'^\s*time\s+(-?\d+)\s*$', re.IGNORECASE)
+    lines = smd_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+
+    out = []
+    in_sk = False
+    idx = -1
+    for raw in lines:
+        st = raw.strip().lower()
+        if st == "skeleton":
+            in_sk = True
+            out.append(raw)
+            continue
+        if st == "end":
+            in_sk = False
+            out.append(raw)
+            continue
+        if in_sk and time_re.match(raw):
+            idx += 1
+            out.append(raw)
+            continue
+        if in_sk and idx >= 0:
+            m = bone_re.match(raw)
+            if m:
+                dz = deltas[idx] if idx < len(deltas) else 0.0
+                z = float(m.group(6)) + dz
+                out.append(f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{m.group(5)}{z:.6f}{m.group(7)}\n")
+                continue
+        out.append(raw)
+    smd_path.write_text("".join(out), encoding="utf-8", errors="ignore")
+
+
 def ramp_root_z(smd_path: Path, delta: float) -> None:
     """
     Adds a linear ramp of `delta` to the root bone's Z, none of it on the first
@@ -2064,6 +2104,7 @@ def main() -> int:
         dup_anim.setdefault(old, []).append(new)
 
     anim_paths: List[Path] = []
+    extra_anim_paths: Dict[str, Path] = {}
     dup_sequences: List[QcSequence] = []
     flattened = 0
     renamed = 0
@@ -2135,6 +2176,7 @@ def main() -> int:
         sequences.append(QcSequence(qc_name=name, smd_base=sanitize_token(name),
                                     fps=fps, loop=loop))
         anim_paths.append(dst)
+        extra_anim_paths[name] = dst
     if args.extra_anim:
         print(f"== Added {len(args.extra_anim)} extra sequence(s) (--extra-anim) ==")
     if flattened:
@@ -2410,6 +2452,78 @@ def main() -> int:
             if fixed:
                 print(f"== death plant: {fixed} death anim(s) did not rest on "
                       f"{args.feet_z:g}, ramped ==")
+                build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=out_path,
+                          mesh_paths=mesh_paths, anim_paths=anim_paths,
+                          workdir=workdir, modelname=modelname)
+
+        # 8a3) Plant the --extra-anim sequences.
+        #
+        # A loose SMD was authored against its own rig's rest pose, and the
+        # retarget pins its first frame to THIS model's root height, so whatever
+        # the two rigs disagree on by shows up as the animation floating or
+        # sinking. The roll pair came in 13 units up at the start and 19 up at
+        # the end, which reads as the character levitating and then dropping.
+        #
+        # The reference is the model's own first framegroup, normally an idle:
+        # whatever height that rests at is this model's ground, with no flag to
+        # pass and nothing assumed about --feet-z. A constant lands the start and
+        # a ramp closes the remaining error at the end, the same pairing the
+        # death plant uses, so a genuine rise or fall inside the animation is
+        # left alone.
+        if extra_anim_paths and framegroup_entries:
+            ground = measure_animated_feet_z(out_path, framegroup_entries[0][0])
+            planted = 0
+            for name, apath in extra_anim_paths.items():
+                ent = next((e for e in framegroup_entries if e[4] == name), None)
+                if ent is None or ent[1] < 2:
+                    continue
+                first = measure_animated_feet_z(out_path, ent[0]) - ground
+                last = measure_animated_feet_z(out_path, ent[0] + ent[1] - 1) - ground
+                if abs(first) <= 1.0 and abs(last) <= 1.0:
+                    continue
+                offset_root_bone(apath, 0.0, 0.0, -first)
+                ramp_root_z(apath, -(last - first))
+                print(f"   [extra plant] {name}: {first:+.2f} start, {last:+.2f} end "
+                      f"relative to {ground:.2f}")
+                planted += 1
+            if planted:
+                print(f"== extra plant: {planted} sequence(s) levelled onto the "
+                      f"model's own resting height ==")
+                build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=out_path,
+                          mesh_paths=mesh_paths, anim_paths=anim_paths,
+                          workdir=workdir, modelname=modelname)
+
+            # Levelling the two ends says nothing about the frames between them.
+            # A roll tips the body below its own root partway through, and on a
+            # rig the animation was not authored for that lands under the floor.
+            #
+            # So every frame is measured and only the ones that sink get lifted,
+            # each by its own shortfall. Frames already clear are left exactly as
+            # they are, which keeps the airborne part of a roll airborne instead
+            # of flattening the whole thing onto the ground.
+            sunk = 0
+            for name, apath in extra_anim_paths.items():
+                ent = next((e for e in framegroup_entries if e[4] == name), None)
+                if ent is None:
+                    continue
+                deltas = []
+                worst = 0.0
+                for f in range(ent[1]):
+                    below = ground - measure_animated_feet_z(out_path, ent[0] + f)
+                    if below > 0.05:
+                        deltas.append(below)
+                        worst = max(worst, below)
+                    else:
+                        deltas.append(0.0)
+                if worst <= 0.05:
+                    continue
+                offset_root_z_frames(apath, deltas)
+                print(f"   [extra floor] {name}: worst {worst:.2f} below ground, "
+                      f"{sum(1 for d in deltas if d)} of {ent[1]} frame(s) lifted")
+                sunk += 1
+            if sunk:
+                print(f"== extra floor: {sunk} sequence(s) pulled up out of the "
+                      f"ground ==")
                 build_iqm(iqm_exe=iqm_exe, rotate=args.rotate, out_path=out_path,
                           mesh_paths=mesh_paths, anim_paths=anim_paths,
                           workdir=workdir, modelname=modelname)
