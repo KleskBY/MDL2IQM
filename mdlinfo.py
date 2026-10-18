@@ -18,6 +18,19 @@ from pathlib import Path
 from typing import Dict, List
 
 
+IMG_EXTS = {".bmp", ".tga", ".jpg", ".jpeg", ".pcx", ".png"}
+
+
+def texture_stem(name: str) -> str:
+    """Texture name minus its extension. Valve's v_357 and v_9mmhandgun ship
+    `GLOVE_handpak.bmp.bmp`, so one strip leaves `.bmp` in every name derived
+    from it; keep stripping while an image extension remains."""
+    stem = Path(name.replace("\\", "/")).stem
+    while Path(stem).suffix.lower() in IMG_EXTS:
+        stem = Path(stem).stem
+    return stem
+
+
 # motiontype flags (studio.h:338)
 STUDIO_X = 0x0001
 STUDIO_Y = 0x0002
@@ -127,8 +140,8 @@ class MdlInfo:
             t0 = self.skin_table[0][ref]
             tf = self.skin_table[family][ref]
             if t0 != tf and t0 < len(self.textures) and tf < len(self.textures):
-                stem0 = Path(self.textures[t0].name).stem.lower()
-                stemf = Path(self.textures[tf].name).stem
+                stem0 = texture_stem(self.textures[t0].name).lower()
+                stemf = texture_stem(self.textures[tf].name)
                 remap[stem0] = stemf
         return remap
 

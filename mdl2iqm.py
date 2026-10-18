@@ -981,7 +981,7 @@ def rewrite_smd_materials(
         if smd_is_material_line(raw):
             mat = stripped.replace("\\", "/")
             base = mat.split("/")[-1]
-            stem = Path(base).stem
+            stem = mdlinfo.texture_stem(base)
             stems_used.add(stem.lower())
 
             if mesh_tag:
@@ -1253,7 +1253,7 @@ def stage_textures_as_png(
     pngs = [p for p in workdir.rglob("*.png") if p.is_file()]
     src_map: Dict[str, Path] = {}
     for p in pngs:
-        stem = p.stem.lower()
+        stem = mdlinfo.texture_stem(p.name).lower()
         # keep first occurrence; you can change priority if needed
         if stem not in src_map:
             src_map[stem] = p
@@ -2291,8 +2291,10 @@ def main() -> int:
     if args.content_root and not args.no_copy_textures:
         content_root = Path(args.content_root).resolve()
         print(f"== Staging textures to content root: {content_root} ==")
-        if bodygroup_mode:
-            # stage under sanitized names — the .skin files reference these
+        if write_skins:
+            # stage under sanitized names: the .skin files reference these.
+            # Gated on write_skins, not bodygroup_mode: with --skin-groups the
+            # materials stay raw paths and must match the staged filenames
             copies = [(sanitize_mesh_token(st), st) for st in sorted(stems_needed)]
         else:
             # underscore spaces to match the rewritten material paths
